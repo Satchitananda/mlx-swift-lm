@@ -30,11 +30,6 @@ jobs:
           uv pip install pre-commit
           brew install swift-format
      
-      - name: Setup cmake
-        shell: sh
-        run: |
-          brew install cmake ninja
-     
       - name: Run style checks
         shell: sh
         run: |
