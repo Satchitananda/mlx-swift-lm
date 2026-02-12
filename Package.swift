@@ -106,6 +106,7 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
+                "MLXEmbedders",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
@@ -126,6 +127,7 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
+                "MLXEmbedders",
             ],
             path: "Tests/MLXLMIntegrationTests",
             exclude: [
