@@ -520,7 +520,8 @@ public final class LLMModelFactory: ModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
+                from: baseConfig.modelType, configData: configData)
         }
 
         // Load tokenizer and weights in parallel
