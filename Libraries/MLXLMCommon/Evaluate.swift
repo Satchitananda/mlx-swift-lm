@@ -334,8 +334,13 @@ struct TokenRing {
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let n = prompt.dim(0)
-        let promptTokens = prompt.asType(.int32)
+        // VLM prompts arrive as 2-D [1, n]; dim(0) returns 1 (batch) not n (sequence length).
+        // Flatten first so n is the true sequence length. Fixes broadcast crash on all VLM models.
+        // Ref: ml-explore/mlx-swift-lm#168, PR#170 (spokvulcan), shareup/mlx-swift-lm#8 (atdrendel),
+        //      Satchitananda/mlx-swift-lm (bulentongun)
+        let flat = prompt.reshaped(-1)
+        let n = flat.dim(0)
+        let promptTokens = flat.asType(.int32)
         if n <= capacity {
             if n < capacity {
                 let padding = MLXArray.zeros([capacity - n], type: Int32.self)
