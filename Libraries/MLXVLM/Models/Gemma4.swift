@@ -1703,9 +1703,13 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         let imageMask = inputIds .== config.imageTokenId
         let expectedImageTokens = imageMask.asType(.int32).sum().item(Int.self)
 
-        if expectedImageTokens != imageFeatures.dim(1) {
+        // imageFeatures has shape [N_images, tokensPerImage, hiddenSize].
+        // expectedImageTokens is the count of image-token placeholders across the entire prompt
+        // (= N_images * tokensPerImage). Use the product, not just dim(1), so multi-image inputs work.
+        let totalVisionTokens = imageFeatures.dim(0) * imageFeatures.dim(1)
+        if expectedImageTokens != totalVisionTokens {
             throw Gemma4Error.imageTokenCountMismatch(
-                expectedVisionTokens: imageFeatures.dim(1), actualPromptTokens: expectedImageTokens)
+                expectedVisionTokens: totalVisionTokens, actualPromptTokens: expectedImageTokens)
         }
 
         var imageMaskExpanded = expandedDimensions(imageMask, axis: -1)
