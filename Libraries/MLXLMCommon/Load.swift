@@ -76,8 +76,15 @@ public func loadWeights(
     }
 
     // apply the loaded weights
+    //
+    // Use .noUnusedKeys only (not .all) because pre-quantized models in non-affine formats
+    // (e.g. mxfp8) produce a shape/zero-point mismatch between the QuantizedLinear created
+    // by quantize(model:) and the actual safetensors layout:
+    //   • mxfp8 weights are packed [rows, cols/4] U32 vs affine int8 [rows, cols]
+    //   • mxfp8 has no zero-point ('biases') keys; affine QuantizedLinear always creates one
+    // .noUnusedKeys still catches any unexpected extra keys in the checkpoint.
     let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
+    try model.update(parameters: parameters, verify: [.noUnusedKeys])
 
     eval(model)
 }
