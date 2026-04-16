@@ -209,12 +209,6 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
             weights["lm_head.weight"] = nil
         }
 
-        // mxfp8 quantization stores per-group zero-points as '.biases' keys.
-        // QuantizedLinear.biases is a `let` constant and cannot be set via
-        // Module.update(parameters:), so strip these keys to let loading proceed.
-        // The module uses init-time zero zero-points (equivalent to symmetric quant).
-        weights = weights.filter { !$0.key.hasSuffix(".biases") }
-
         return weights
     }
 }
