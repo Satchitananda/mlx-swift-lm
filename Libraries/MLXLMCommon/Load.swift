@@ -62,26 +62,43 @@ public func loadWeights(
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
+        quantize(
+            model: model,
+            filter: { path, module in
+                if weights["\(path).scales"] != nil {
+                    if let perLayerQuantization {
+                        return perLayerQuantization.quantization(layer: path)?.asTuple
+                    } else {
+                        return quantization?.asTuple
+                    }
                 } else {
-                    return quantization?.asTuple
+                    return nil
                 }
-            } else {
-                return nil
+            },
+            apply: { layer, groupSize, bits, mode in
+                // mxfp8 matmul kernel requires biases == nil (zero-points don't exist
+                // in this format). QuantizedLinear's default init always produces non-nil
+                // biases via affine quantization, which crashes at inference.
+                // Use the explicit initializer with biases:nil; weight/scales are
+                // overwritten by model.update(parameters:) with the real checkpoint data.
+                if mode == .mxfp8, let linear = layer as? Linear {
+                    let w = linear.weight
+                    let dummyScales = MLXArray.zeros([w.dim(0), max(1, w.dim(1) / groupSize)])
+                    return QuantizedLinear(
+                        weight: w, bias: linear.bias,
+                        scales: dummyScales, biases: nil,
+                        groupSize: groupSize, bits: bits, mode: mode)
+                }
+                return quantizeSingle(layer: layer, groupSize: groupSize, bits: bits, mode: mode)
             }
-        }
+        )
     }
 
     // apply the loaded weights
     //
-    // Use .noUnusedKeys only (not .all) because pre-quantized models in non-affine formats
-    // (e.g. mxfp8) produce a shape/zero-point mismatch between the QuantizedLinear created
-    // by quantize(model:) and the actual safetensors layout:
-    //   • mxfp8 weights are packed [rows, cols/4] U32 vs affine int8 [rows, cols]
-    //   • mxfp8 has no zero-point ('biases') keys; affine QuantizedLinear always creates one
+    // Use .noUnusedKeys only (not .all) because pre-quantized mxfp8 models have a
+    // different weight layout than the affine QuantizedLinear created by quantize(model:)
+    // above (shapes are reconciled via _updateInternal once the real data is applied).
     // .noUnusedKeys still catches any unexpected extra keys in the checkpoint.
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.noUnusedKeys])
