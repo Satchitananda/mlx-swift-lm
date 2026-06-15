@@ -26,9 +26,19 @@ public enum MTPDrafterTypeRegistry {
 public class MTPDrafterRegistry: AbstractModelRegistry, @unchecked Sendable {
     public static let shared = MTPDrafterRegistry(modelConfigurations: all())
 
+    // E2B
+    public static let gemma4_E2B_qat_assistant_mxfp4 = ModelConfiguration(
+        id: "mlx-community/gemma-4-E2B-it-qat-assistant-mxfp4"
+    )
+    // E4B
+    public static let gemma4_E4B_qat_assistant_mxfp4 = ModelConfiguration(
+        id: "mlx-community/gemma-4-E4B-it-qat-assistant-mxfp4"
+    )
+    // 12B
     public static let gemma4_12B_assistant_4bit = ModelConfiguration(
         id: "mlx-community/gemma-4-12B-it-assistant-4bit"
     )
+    // 26B / 31B (large model experiments)
     public static let gemma4_26B_assistant_bf16 = ModelConfiguration(
         id: "mlx-community/gemma-4-26B-A4B-it-assistant-bf16"
     )
@@ -37,7 +47,13 @@ public class MTPDrafterRegistry: AbstractModelRegistry, @unchecked Sendable {
     )
 
     private static func all() -> [ModelConfiguration] {
-        [gemma4_12B_assistant_4bit, gemma4_26B_assistant_bf16, gemma4_31B_assistant_bf16]
+        [
+            gemma4_E2B_qat_assistant_mxfp4,
+            gemma4_E4B_qat_assistant_mxfp4,
+            gemma4_12B_assistant_4bit,
+            gemma4_26B_assistant_bf16,
+            gemma4_31B_assistant_bf16,
+        ]
     }
 }
 
