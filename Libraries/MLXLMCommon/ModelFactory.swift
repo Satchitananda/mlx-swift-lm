@@ -77,15 +77,20 @@ public struct ModelContext {
     public var model: any LanguageModel
     public var processor: any UserInputProcessor
     public var tokenizer: Tokenizer
+    /// Parsed `generation_config.json`, if present in the model directory.
+    /// Contains model-card recommended `temperature`, `topK`, `topP`.
+    public var generationConfig: GenerationConfigFile?
 
     public init(
         configuration: ModelConfiguration, model: any LanguageModel,
-        processor: any UserInputProcessor, tokenizer: any Tokenizer
+        processor: any UserInputProcessor, tokenizer: any Tokenizer,
+        generationConfig: GenerationConfigFile? = nil
     ) {
         self.configuration = configuration
         self.model = model
         self.processor = processor
         self.tokenizer = tokenizer
+        self.generationConfig = generationConfig
     }
 }
 
