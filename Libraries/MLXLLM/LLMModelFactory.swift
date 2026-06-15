@@ -572,23 +572,23 @@ public final class LLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
+        // Load generation_config.json for EOS token IDs and recommended sampling params.
         var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        let generationConfig: GenerationConfigFile? =
+        let parsedGenerationConfig: GenerationConfigFile? =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
                 try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
             } else {
                 nil
             }
-        if let genEosIds = generationConfig?.eosTokenIds?.values {
+        if let genEosIds = parsedGenerationConfig?.eosTokenIds?.values {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
         // Build a ModelConfiguration with loaded EOS token IDs and tool call format
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
-        mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+        mutableConfiguration.stopStrings.formUnion(parsedGenerationConfig?.stopStrings ?? [])
         if mutableConfiguration.toolCallFormat == nil {
             mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
                 from: baseConfig.modelType, configData: configData)
@@ -639,7 +639,7 @@ public final class LLMModelFactory: GenericModelFactory {
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
-            tokenizer: tokenizer)
+            tokenizer: tokenizer, generationConfig: parsedGenerationConfig)
     }
 
 }
