@@ -26,9 +26,13 @@ public enum MTPDrafterTypeRegistry {
 public class MTPDrafterRegistry: AbstractModelRegistry, @unchecked Sendable {
     public static let shared = MTPDrafterRegistry(modelConfigurations: all())
 
-    // E2B
+    // E2B (mxfp4 QAT — use_ordered_embeddings=true, sparse MaskedEmbedder LM head)
     public static let gemma4_E2B_qat_assistant_mxfp4 = ModelConfiguration(
         id: "mlx-community/gemma-4-E2B-it-qat-assistant-mxfp4"
+    )
+    // E2B (bf16 — use_ordered_embeddings=false, dense asLinear LM head)
+    public static let gemma4_E2B_assistant_bf16 = ModelConfiguration(
+        id: "mlx-community/gemma-4-E2B-it-assistant-bf16"
     )
     // E4B
     public static let gemma4_E4B_qat_assistant_mxfp4 = ModelConfiguration(
@@ -49,6 +53,7 @@ public class MTPDrafterRegistry: AbstractModelRegistry, @unchecked Sendable {
     private static func all() -> [ModelConfiguration] {
         [
             gemma4_E2B_qat_assistant_mxfp4,
+            gemma4_E2B_assistant_bf16,
             gemma4_E4B_qat_assistant_mxfp4,
             gemma4_12B_assistant_4bit,
             gemma4_26B_assistant_bf16,
