@@ -350,15 +350,18 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
+        // Load generation_config.json for EOS token IDs and recommended sampling params.
         var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
+        var parsedGenerationConfig: GenerationConfigFile?
         if let generationData = try? Data(contentsOf: generationConfigURL),
             let generationConfig = try? JSONDecoder.json5().decode(
-                GenerationConfigFile.self, from: generationData),
-            let genEosIds = generationConfig.eosTokenIds?.values
+                GenerationConfigFile.self, from: generationData)
         {
-            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
+            parsedGenerationConfig = generationConfig
+            if let genEosIds = generationConfig.eosTokenIds?.values {
+                eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
+            }
         }
 
         var mutableConfiguration = configuration
@@ -425,7 +428,7 @@ public final class VLMModelFactory: GenericModelFactory {
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
-            tokenizer: tokenizer)
+            tokenizer: tokenizer, generationConfig: parsedGenerationConfig)
     }
 
 }
