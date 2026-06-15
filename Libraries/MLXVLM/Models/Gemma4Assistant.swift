@@ -92,10 +92,42 @@ public final class Gemma4AssistantMaskedEmbedder: Module {
     }
 
     public func callAsFunction(_ hiddenStates: MLXArray, lmHeadWeight: MLXArray) -> MLXArray {
-        fatalError(
-            "Gemma4AssistantMaskedEmbedder forward not implemented yet — requires a "
-                + "use_ordered_embeddings=true checkpoint to verify; current fixtures "
-                + "use the tied-lm_head path.")
+        let B = hiddenStates.dim(0)
+        let L = hiddenStates.dim(1)
+        let C = topK * vocabSizePerCentroid
+        let vpk = vocabSizePerCentroid
+
+        // Step 1: route each hidden state to centroids — [B, L, numCentroids]
+        let centroidLogits = centroids(hiddenStates)
+
+        // Step 2: top-K centroid indices (descending = argsort of negated) — [B, L, topK]
+        let topCentroidIds = argSort(-centroidLogits, axis: -1)[.ellipsis, 0 ..< topK]
+            .asType(.int32)
+
+        // Step 3: ordered positions in tokenOrdering for each candidate
+        // centroid_id * vpk + arange(vpk): [B, L, topK, 1] + [vpk] → [B, L, topK, vpk] → [B, L, C]
+        let candidateOrderedPos =
+            (topCentroidIds.expandedDimensions(axis: -1) * vpk + arange(vpk))
+            .reshaped([B, L, C])
+
+        // Step 4: gather vocab token IDs — [B, L, C] int32
+        let candidateTokenIds = tokenOrdering.take(candidateOrderedPos)
+
+        // Step 5: gather lm_head row-vectors for candidates — [B, L, C, hiddenSize]
+        let candidateWeights = lmHeadWeight.take(candidateTokenIds, axis: 0)
+
+        // Step 6: logit for each candidate = dot(h, w) — [B, L, C]
+        // [B, L, C, H] * [B, L, 1, H] → sum over H → [B, L, C]
+        let candidateLogits =
+            (candidateWeights * hiddenStates.expandedDimensions(axis: -2)).sum(axis: -1)
+
+        // Step 7: scatter candidate logits into full-vocab array (background = −∞)
+        let out = full([B, L, vocabSize], values: Float(-Float.infinity))
+            .asType(hiddenStates.dtype)
+        let bIdx = arange(B).reshaped([B, 1, 1])
+        let lIdx = arange(L).reshaped([1, L, 1])
+        out[bIdx, lIdx, candidateTokenIds] = candidateLogits
+        return out
     }
 }
 
