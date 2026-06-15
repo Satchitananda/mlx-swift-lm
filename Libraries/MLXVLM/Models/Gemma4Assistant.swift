@@ -91,7 +91,10 @@ public final class Gemma4AssistantMaskedEmbedder: Module {
         super.init()
     }
 
-    public func callAsFunction(_ hiddenStates: MLXArray, lmHeadWeight: MLXArray) -> MLXArray {
+    /// - Parameter lmHead: the tied word embedding (may be `QuantizedEmbedding`).
+    ///   Calling `lmHead(candidateTokenIds)` correctly dequantizes for quantized
+    ///   checkpoints; accessing `.weight` directly returns packed uint32, not float.
+    public func callAsFunction(_ hiddenStates: MLXArray, lmHead: Embedding) -> MLXArray {
         let B = hiddenStates.dim(0)
         let L = hiddenStates.dim(1)
         let C = topK * vocabSizePerCentroid
@@ -113,8 +116,10 @@ public final class Gemma4AssistantMaskedEmbedder: Module {
         // Step 4: gather vocab token IDs — [B, L, C] int32
         let candidateTokenIds = tokenOrdering.take(candidateOrderedPos)
 
-        // Step 5: gather lm_head row-vectors for candidates — [B, L, C, hiddenSize]
-        let candidateWeights = lmHeadWeight.take(candidateTokenIds, axis: 0)
+        // Step 5: gather lm_head row-vectors — [B, L, C, hiddenSize]
+        // Use lmHead(ids) not lmHead.weight.take(ids): QuantizedEmbedding.callAsFunction
+        // dequantizes on the fly; raw .weight is packed uint32, not float.
+        let candidateWeights = lmHead(candidateTokenIds)
 
         // Step 6: logit for each candidate = dot(h, w) — [B, L, C]
         // [B, L, C, H] * [B, L, 1, H] → sum over H → [B, L, C]
@@ -315,7 +320,7 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
 
         let logits: MLXArray
         if let maskedEmbedding {
-            logits = maskedEmbedding(h, lmHeadWeight: model.embedTokens.weight)
+            logits = maskedEmbedding(h, lmHead: model.embedTokens)
         } else if config.tieWordEmbeddings {
             logits = model.embedTokens.asLinear(h)
         } else {
