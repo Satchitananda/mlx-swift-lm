@@ -2700,10 +2700,13 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     }
 
     public var fixedSize: CGSize {
+        // 800x800 keeps the patch count under Gemma4's 280 * 3^2 vision budget. The published
+        // gemma-4 processor_config ships size=224, which patchifies to a fraction of that budget
+        // and starves the model of detail (it can't tell an indoor showroom from a night street).
+        // Floor the configured size at 800 so the model actually uses the tokens it allocates.
         if let size {
-            return CGSize(width: size.width, height: size.height)
+            return CGSize(width: max(size.width, 800), height: max(size.height, 800))
         }
-        // 800x800 keeps the patch count under Gemma4's 280 * 3^2 vision budget.
         return CGSize(width: 800, height: 800)
     }
 }
@@ -2837,15 +2840,19 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     }
 
     public var fixedSize: CGSize {
+        // Side length that fills the soft-token budget: floor(sqrt(maxSoftTokens)) patches/side.
+        let budgetSide = max(1, Int(floor(sqrt(Double(maxSoftTokens))))) * modelPatchSize
         if let size {
             let width = max(modelPatchSize, (size.width / modelPatchSize) * modelPatchSize)
             let height = max(modelPatchSize, (size.height / modelPatchSize) * modelPatchSize)
-            return CGSize(width: width, height: height)
+            // The published gemma-4 processor_config ships size=224, which patchifies to only
+            // (224/48)^2 = 16 soft tokens — 6% of the 280-token budget — starving the model of
+            // visual detail (it can't distinguish e.g. an indoor showroom from a night street).
+            // Never resize below the budget-derived side, so the model actually uses the tokens
+            // it allocates (768 → 16×16 = 256 real patches at the default 280 budget).
+            return CGSize(width: max(width, budgetSide), height: max(height, budgetSide))
         }
-
-        let patchesPerSide = max(1, Int(floor(sqrt(Double(maxSoftTokens)))))
-        let side = patchesPerSide * modelPatchSize
-        return CGSize(width: side, height: side)
+        return CGSize(width: budgetSide, height: budgetSide)
     }
 }
 
