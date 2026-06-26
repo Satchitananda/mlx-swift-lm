@@ -2808,12 +2808,21 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
             try c.decodeIfPresent(Int.self, forKey: CodingKeys.modelPatchSize)
             ?? imageProcessor?.modelPatchSize
             ?? patchSize * poolingKernelSize
-        maxSoftTokens =
+        let baseMaxSoftTokens =
             try c.decodeIfPresent(Int.self, forKey: CodingKeys.maxSoftTokens)
             ?? c.decodeIfPresent(Int.self, forKey: CodingKeys.numSoftTokens)
             ?? imageProcessor?.maxSoftTokens
             ?? imageProcessor?.numSoftTokens
             ?? 280
+        // SightRoll quality-tier detail bump: the published gemma-4-12b processor budgets 280 soft
+        // tokens; scale it 1.5x so the 12b model resolves fine distinctions (e.g. cat vs puppy).
+        // Only the Unified processor (the 12b "quality" tier) reads this config — e2b/e4b use the
+        // non-unified Gemma4Processor and are unaffected. 420 stays well under the model's
+        // mm_posemb_size ceiling (1120); fixedSize and realCount both derive from maxSoftTokens, so
+        // the per-image placeholder count stays consistent with the produced soft tokens (no token
+        // mismatch / broadcast crash). The non-unified e4b/medium path is hard-capped at its vision
+        // defaultOutputLength and cannot be bumped the same way, so it is left as published.
+        maxSoftTokens = Int((Double(baseMaxSoftTokens) * 1.5).rounded())
         imageSeqLength =
             try c.decodeIfPresent(Int.self, forKey: CodingKeys.imageSeqLength) ?? maxSoftTokens
         audioSeqLength =
