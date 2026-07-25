@@ -62,12 +62,12 @@ public struct Gemma4AssistantConfiguration: Codable, Sendable {
 /// Mirrors mlx-vlm's
 /// `mlx_vlm/speculative/drafters/gemma4_assistant/masked_embedder.py`.
 ///
-/// **Phase A note:** the 26B-A4B-bf16 and 31B-bf16 reference checkpoints
-/// both ship `use_ordered_embeddings=false`, so this module's forward path
-/// is not exercised by any current verification fixture. The module is
-/// declared (and its weights would load correctly) but `callAsFunction` is
-/// a TODO — implementation lands when a checkpoint with the centroid path
-/// becomes available for verification.
+/// The E-series drafters (`gemma-4-E2B/E4B-it-assistant-bf16`) ship
+/// `use_ordered_embeddings=true` and route their logits through this head;
+/// the 26B-A4B/31B drafters ship `false` and use the tied `lm_head` matmul
+/// instead. The forward is pinned against an independent dense reference by
+/// `testMaskedEmbedderSelectedLogitsMatchDense` (no checkpoint required) and
+/// exercised end-to-end by the `TEST_E{2,4}B_PAIR`-gated integration tests.
 public final class Gemma4AssistantMaskedEmbedder: Module {
     @ModuleInfo(key: "centroids") public var centroids: Linear
     @ParameterInfo(key: "token_ordering") public var tokenOrdering: MLXArray
@@ -91,48 +91,45 @@ public final class Gemma4AssistantMaskedEmbedder: Module {
         super.init()
     }
 
-    /// - Parameter lmHead: the tied word embedding (may be `QuantizedEmbedding`).
-    ///   Calling `lmHead(candidateTokenIds)` correctly dequantizes for quantized
-    ///   checkpoints; accessing `.weight` directly returns packed uint32, not float.
-    public func callAsFunction(_ hiddenStates: MLXArray, lmHead: Embedding) -> MLXArray {
-        let B = hiddenStates.dim(0)
-        let L = hiddenStates.dim(1)
-        let C = topK * vocabSizePerCentroid
-        let vpk = vocabSizePerCentroid
+    /// Centroid-routed sparse logits. Port of mlx-vlm `MaskedEmbedder.__call__`
+    /// + `_selected_logits` (`masked_embedder.py`): score the `numCentroids`
+    /// clusters, expand the top-K, score only those tokens against the tied
+    /// embedding, and scatter back to full vocab with unselected positions
+    /// pushed below the selected minimum so they lose argmax/softmax.
+    /// `tiedEmbedding` is the drafter's tied token embedding *module*, not its
+    /// raw `.weight`: gathering through the module's forward returns dense
+    /// `[N, H]` rows for a plain `Embedding` and dequantized rows for a
+    /// `QuantizedEmbedding` (whose `.weight` is packed `[vocab, H·bits/32]` and
+    /// cannot be reshaped to `H`). Every mlx-community E-series drafter ships
+    /// quantized, so this must handle both.
+    public func callAsFunction(_ hiddenStates: MLXArray, tiedEmbedding: Embedding) -> MLXArray {
+        let b = hiddenStates.dim(0)
+        let l = hiddenStates.dim(1)
+        let n = topK * vocabSizePerCentroid
 
-        // Step 1: route each hidden state to centroids — [B, L, numCentroids]
-        let centroidLogits = centroids(hiddenStates)
+        // Top-K clusters (unordered), mirroring argpartition(...)[..., -top_k:].
+        let centroidLogits = centroids(hiddenStates)  // [B, L, numCentroids]
+        let topkIdx = argPartition(centroidLogits, kth: -topK, axis: -1)[.ellipsis, (-topK)...]
 
-        // Step 2: top-K centroid indices (descending = argsort of negated) — [B, L, topK]
-        let topCentroidIds = argSort(-centroidLogits, axis: -1)[.ellipsis, 0 ..< topK]
-            .asType(.int32)
+        // Each cluster owns a contiguous block of canonical token IDs.
+        let ordering = tokenOrdering.reshaped([numCentroids, vocabSizePerCentroid])
+        let selectedCanonical = ordering.take(topkIdx, axis: 0)  // [B, L, topK, vsc]
 
-        // Step 3: ordered positions in tokenOrdering for each candidate
-        // centroid_id * vpk + arange(vpk): [B, L, topK, 1] + [vpk] → [B, L, topK, vpk] → [B, L, C]
-        let candidateOrderedPos =
-            (topCentroidIds.expandedDimensions(axis: -1) * vpk + arange(vpk))
-            .reshaped([B, L, C])
+        // Gather just those rows from the tied embedding and score them. The
+        // embedding forward dequantizes when the module is quantized.
+        let selectedEmb =
+            tiedEmbedding(selectedCanonical.reshaped([-1]))
+            .reshaped([b, l, n, hiddenSize])  // [B, L, N, H]
+        let selectedLogits = matmul(
+            hiddenStates.expandedDimensions(axis: -2),  // [B, L, 1, H]
+            selectedEmb.swappedAxes(-1, -2)  // [B, L, H, N]
+        ).squeezed(axis: -2)  // [B, L, N]
 
-        // Step 4: gather vocab token IDs — [B, L, C] int32
-        let candidateTokenIds = tokenOrdering.take(candidateOrderedPos)
-
-        // Step 5: gather lm_head row-vectors — [B, L, C, hiddenSize]
-        // Use lmHead(ids) not lmHead.weight.take(ids): QuantizedEmbedding.callAsFunction
-        // dequantizes on the fly; raw .weight is packed uint32, not float.
-        let candidateWeights = lmHead(candidateTokenIds)
-
-        // Step 6: logit for each candidate = dot(h, w) — [B, L, C]
-        // [B, L, C, H] * [B, L, 1, H] → sum over H → [B, L, C]
-        let candidateLogits =
-            (candidateWeights * hiddenStates.expandedDimensions(axis: -2)).sum(axis: -1)
-
-        // Step 7: scatter candidate logits into full-vocab array (background = −∞)
-        let out = full([B, L, vocabSize], values: Float(-Float.infinity))
-            .asType(hiddenStates.dtype)
-        let bIdx = arange(B).reshaped([B, 1, 1])
-        let lIdx = arange(L).reshaped([1, L, 1])
-        out[bIdx, lIdx, candidateTokenIds] = candidateLogits
-        return out
+        // Scatter to full vocab; mask_value kept on-device (no .item() sync).
+        let maskValue = selectedLogits.min() - 1
+        let out = broadcast(maskValue, to: [b, l, vocabSize]).asType(hiddenStates.dtype)
+        let scatterIdx = selectedCanonical.reshaped([b, l, n])
+        return putAlong(out, scatterIdx, values: selectedLogits, axis: -1)
     }
 }
 
@@ -274,15 +271,36 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         // Per-layer-type masks; KV tensor shape is [B, H, S, D] so axis -2 = seq.
         let fullKvLen = sharedKV["full_attention"].map { $0.0.dim(-2) } ?? 0
         let slidingKvLen = sharedKV["sliding_attention"].map { $0.0.dim(-2) } ?? 0
-        // The main model's sliding-attention KV may exceed the drafter's
-        // slidingWindow when the backbone uses a larger window than the drafter.
-        // createBidirectionalSlidingWindowMask handles this: it attends to the
-        // newest `windowSize` positions and blocks the rest, which is correct.
         let fullMask = createBidirectionalMask(
             queryLen: queryLen, kvLen: fullKvLen, dtype: h.dtype)
-        let slidingMask = createBidirectionalSlidingWindowMask(
-            queryLen: queryLen, kvLen: slidingKvLen,
-            windowSize: textCfg.slidingWindow, dtype: h.dtype)
+        // When the target's sliding-attention cache is bounded by the drafter's
+        // `slidingWindow` (same window on both sides), the helper's early-exit
+        // (`windowSize >= kvLen` → all-zeros mask) is the production path.
+        // When the backbone uses a LARGER sliding window than the drafter
+        // (e.g. an assistant with a 512 window drafted against a wider-window
+        // backbone), the shared sliding KV can legitimately exceed the
+        // drafter's window. The helper's non-degenerate path is an
+        // absolute-position mask (`kIdx < windowSize`), which is NOT what the
+        // drafter needs here, so build a newest-`windowSize` mask inline:
+        // the target's `RotatingKVCache` snapshot is temporally ordered
+        // (oldest at index 0) until the backbone's own window forces rotation,
+        // which cannot have happened while `slidingKvLen` is still growing
+        // past the drafter's smaller window.
+        let slidingMask: MLXArray
+        if slidingKvLen <= textCfg.slidingWindow {
+            slidingMask = createBidirectionalSlidingWindowMask(
+                queryLen: queryLen, kvLen: slidingKvLen,
+                windowSize: textCfg.slidingWindow, dtype: h.dtype)
+        } else {
+            let kIdx = MLXArray(Int32(0) ..< Int32(slidingKvLen))
+            let attend = kIdx .>= Int32(slidingKvLen - textCfg.slidingWindow)
+            let row = MLX.where(
+                attend,
+                MLXArray(0, dtype: h.dtype),
+                MLXArray(-Float.infinity, dtype: h.dtype)
+            )
+            slidingMask = broadcast(row[.newAxis, 0...], to: [queryLen, slidingKvLen])
+        }
 
         for layer in model.layers {
             guard let kvPair = sharedKV[layer.layerType] else {
@@ -305,7 +323,7 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
 
         let logits: MLXArray
         if let maskedEmbedding {
-            logits = maskedEmbedding(h, lmHead: model.embedTokens)
+            logits = maskedEmbedding(h, tiedEmbedding: model.embedTokens)
         } else if config.tieWordEmbeddings {
             logits = model.embedTokens.asLinear(h)
         } else {

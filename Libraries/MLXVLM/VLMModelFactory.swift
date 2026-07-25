@@ -367,19 +367,19 @@ public final class VLMModelFactory: GenericModelFactory {
         // Load generation_config.json for EOS token IDs and recommended sampling params.
         var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        let generationConfig: GenerationConfigFile? =
+        let parsedGenerationConfig: GenerationConfigFile? =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
                 try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
             } else {
                 nil
             }
-        if let genEosIds = generationConfig?.eosTokenIds?.values {
+        if let genEosIds = parsedGenerationConfig?.eosTokenIds?.values {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
-        mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+        mutableConfiguration.stopStrings.formUnion(parsedGenerationConfig?.stopStrings ?? [])
 
         // Auto-detect tool call format from model type if not explicitly set
         if mutableConfiguration.toolCallFormat == nil {
@@ -443,7 +443,7 @@ public final class VLMModelFactory: GenericModelFactory {
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
-            tokenizer: tokenizer, generationConfig: generationConfig)
+            tokenizer: tokenizer, generationConfig: parsedGenerationConfig)
     }
 
 }

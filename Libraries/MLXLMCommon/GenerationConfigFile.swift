@@ -12,20 +12,18 @@ import Foundation
 /// so callers can apply model-card defaults instead of hardcoded values.
 public struct GenerationConfigFile: Codable, Sendable {
     public var eosTokenIds: IntOrIntArray?
-    // Fork addition: model-card sampling defaults surfaced to callers.
+    public var stopStrings: Set<String>
     public var temperature: Float?
     public var topK: Int?
     public var topP: Float?
-    // Upstream 3.31.4: runtime stop strings (`stop_strings` / `stop`).
-    public var stopStrings: Set<String>
 
     enum CodingKeys: String, CodingKey {
         case eosTokenIds = "eos_token_id"
-        case temperature = "temperature"
-        case topK       = "top_k"
-        case topP       = "top_p"
         case stopStrings = "stop_strings"
         case stop
+        case temperature = "temperature"
+        case topK = "top_k"
+        case topP = "top_p"
     }
 
     public init(eosTokenIds: IntOrIntArray? = nil, stopStrings: Set<String> = []) {
