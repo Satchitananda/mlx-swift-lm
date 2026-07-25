@@ -85,12 +85,46 @@ public protocol KVCache: Evaluatable {
 
     /// Create an independent deep copy of this cache.
     func copy() -> any KVCache
+
+    /// Prepare cache metadata for a batched sequence.
+    func prepare(lengths: [Int]?)
+
+    /// Prepare cache metadata for a batched sequence.
+    func prepare(lengths: MLXArray?)
+
+    /// Clear transient cache metadata after generation.
+    func finalize()
 }
 
 extension KVCache {
     public var ropeOffset: RoPEOffset {
         .scalar(offset)
     }
+
+    public func prepare(lengths: [Int]?) {}
+
+    public func prepare(lengths: MLXArray?) {}
+
+    public func finalize() {}
+}
+
+public func withPreparedCache<Result>(
+    _ cache: [any KVCache],
+    lengths: [Int]?,
+    _ body: () throws -> Result
+) rethrows -> Result {
+    guard let lengths else {
+        return try body()
+    }
+    for cache in cache {
+        cache.prepare(lengths: lengths)
+    }
+    defer {
+        for cache in cache {
+            cache.finalize()
+        }
+    }
+    return try body()
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -172,6 +206,12 @@ open class BaseKVCache: KVCache {
     open func copy() -> any KVCache {
         fatalError("copy() must be implemented by subclass")
     }
+
+    open func prepare(lengths: [Int]?) {}
+
+    open func prepare(lengths: MLXArray?) {}
+
+    open func finalize() {}
 
     /// Default implementation for caches without special mask requirements
     open func makeMask(
@@ -1163,7 +1203,7 @@ public class ChunkedKVCache: KVCacheSimple {
 
 /// Base cache for array-based state storage
 public class ArraysCache: BaseKVCache {
-    private var cache: [MLXArray?]
+    fileprivate var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
 
@@ -1198,10 +1238,7 @@ public class ArraysCache: BaseKVCache {
     }
 
     internal func copyContents(to new: ArraysCache) {
-        let s = self.state
-        if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
-        }
+        new.cache = cache.map { $0?[.ellipsis] }
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         new.lengths = self.lengths
@@ -1244,15 +1281,15 @@ public class ArraysCache: BaseKVCache {
         lengths = concatenate(lengths, other.lengths)
     }
 
-    public func prepare(lengths: [Int]?) {
+    public override func prepare(lengths: [Int]?) {
         self.lengths = lengths.map { MLXArray($0) }
     }
 
-    public func prepare(lengths: MLXArray?) {
+    public override func prepare(lengths: MLXArray?) {
         self.lengths = lengths
     }
 
-    public func finalize() {
+    public override func finalize() {
         lengths = nil
         leftPadding = nil
     }
@@ -1273,6 +1310,11 @@ public class ArraysCache: BaseKVCache {
     internal var leftPaddingValues: [Int]? {
         guard let leftPadding else { return nil }
         return leftPadding.asArray(Int.self)
+    }
+
+    internal var lengthsValues: [Int]? {
+        guard let lengths else { return nil }
+        return lengths.asArray(Int.self)
     }
 
     internal var presentSlotIndices: [Int] {
@@ -1412,26 +1454,32 @@ public class CacheList: BaseKVCache {
         return new
     }
 
-    public func prepare(lengths: [Int]?) {
-        forEachArraysCache { $0.prepare(lengths: lengths) }
-    }
-
-    public func prepare(lengths: MLXArray?) {
-        forEachArraysCache { $0.prepare(lengths: lengths) }
-    }
-
-    public func finalize() {
-        forEachArraysCache { $0.finalize() }
-    }
-
-    private func forEachArraysCache(_ body: (ArraysCache) -> Void) {
-        for cache in caches {
-            if let arrays = cache as? ArraysCache {
-                body(arrays)
-            } else if let list = cache as? CacheList {
-                list.forEachArraysCache(body)
+    /// Recursively apply a transformation to every non-composite child cache.
+    ///
+    /// `CacheList` children are descended into; any other cache is passed to
+    /// `transform` and replaced by the returned value. This is the primitive
+    /// used by dynamic cache quantization and other cache-wide rewrites for
+    /// models with hybrid attention/recurrent caches (e.g. Falcon-H1).
+    public func mapChildren(_ transform: (KVCache) -> KVCache) {
+        caches = caches.map { child in
+            if let list = child as? CacheList {
+                list.mapChildren(transform)
+                return list
             }
+            return transform(child)
         }
+    }
+
+    public override func prepare(lengths: [Int]?) {
+        caches.forEach { $0.prepare(lengths: lengths) }
+    }
+
+    public override func prepare(lengths: MLXArray?) {
+        caches.forEach { $0.prepare(lengths: lengths) }
+    }
+
+    public override func finalize() {
+        caches.forEach { $0.finalize() }
     }
 
     public override var isTrimmable: Bool {
@@ -1927,8 +1975,18 @@ public func quantizedScaledDotProductAttention(
 
 /// Dynamically quantize KV caches during generation if conditions are met
 ///
+/// Resolve a kvScheme string to (bits, groupSize) for affine quantization.
+/// Returns nil for unrecognized schemes (custom schemes handle their own caches).
+public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int)? {
+    switch scheme {
+    case "affine4": return (4, 64)
+    case "affine8": return (8, 64)
+    default: return nil
+    }
+}
+
 /// Converts regular caches to quantized caches when:
-/// - kvBits is specified
+/// - kvBits is specified (or kvScheme resolves to a built-in affine scheme)
 /// - The cache is not already quantized
 /// - The cache offset is greater than quantizedKVStart
 ///
@@ -1937,43 +1995,74 @@ public func quantizedScaledDotProductAttention(
 ///   - kvBits: Number of bits for quantization (nil = no quantization)
 ///   - kvGroupSize: Group size for quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
+///   - kvScheme: Scheme selector; overrides kvBits when it names a built-in
+///     affine scheme ("affine4", "affine8"). Unrecognized schemes are left to
+///     custom cache implementations and do not quantize here.
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
     kvGroupSize: Int = 64,
-    quantizedKVStart: Int = 0
+    quantizedKVStart: Int = 0,
+    kvScheme: String? = nil
 ) {
-    guard let kvBits = kvBits, !cache.isEmpty else { return }
-
-    // Find the first quantizable (non-Mamba, non-already-quantized) cache entry
-    guard let firstQuantizable = cache.first(where: { $0 is KVCacheSimple }),
-        !(firstQuantizable is QuantizedKVCache),
-        firstQuantizable.offset > quantizedKVStart
-    else {
+    // Resolve effective bits: kvScheme overrides kvBits.
+    let effectiveBits: Int
+    let effectiveGroupSize: Int
+    if let scheme = kvScheme, let resolved = resolveAffineScheme(scheme) {
+        effectiveBits = resolved.bits
+        effectiveGroupSize = resolved.groupSize
+    } else if let kvBits {
+        effectiveBits = kvBits
+        effectiveGroupSize = kvGroupSize
+    } else {
         return
     }
 
-    for i in 0 ..< cache.count {
-        // Handle cache types that support quantization
-        if let simpleCache = cache[i] as? KVCacheSimple {
-            let state = simpleCache.state
-            if state.count == 2 {
-                let keyHeadDim = state[0].dim(3)
-                let valueHeadDim = state[1].dim(3)
-                guard
-                    resolvedKVQuantizationGroupSize(
-                        requested: kvGroupSize,
-                        keyHeadDim: keyHeadDim,
-                        valueHeadDim: valueHeadDim
-                    ) != nil
-                else {
-                    continue
-                }
+    /// Recursively decide whether a cache (or any of its children) is eligible for
+    /// quantization: it must be a plain ``KVCacheSimple`` that is not already
+    /// quantized and whose offset has crossed the requested start threshold.
+    func isQuantizable(_ cache: KVCache) -> Bool {
+        if let list = cache as? CacheList {
+            return list.children.contains(where: isQuantizable)
+        }
+        return cache is KVCacheSimple
+            && !(cache is QuantizedKVCache)
+            && cache.offset > quantizedKVStart
+    }
+
+    guard cache.contains(where: isQuantizable) else {
+        return
+    }
+
+    /// Attempt to convert a single cache to its quantized form. Returns the
+    /// original cache if conversion is not possible for this entry.
+    func quantize(_ cache: KVCacheSimple) -> KVCache {
+        let state = cache.state
+        if state.count == 2 {
+            let keyHeadDim = state[0].dim(3)
+            let valueHeadDim = state[1].dim(3)
+            guard
+                resolvedKVQuantizationGroupSize(
+                    requested: effectiveGroupSize,
+                    keyHeadDim: keyHeadDim,
+                    valueHeadDim: valueHeadDim
+                ) != nil
+            else {
+                return cache
             }
-            cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+        }
+        return cache.toQuantized(groupSize: effectiveGroupSize, bits: effectiveBits)
+    }
+
+    for i in 0 ..< cache.count {
+        if let list = cache[i] as? CacheList {
+            list.mapChildren { child in
+                guard let simpleCache = child as? KVCacheSimple else { return child }
+                return quantize(simpleCache)
+            }
+        } else if let simpleCache = cache[i] as? KVCacheSimple {
+            cache[i] = quantize(simpleCache)
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
-        // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
-        // MambaCache and CacheList don't use traditional KV quantization
     }
 }

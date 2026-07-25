@@ -248,6 +248,43 @@ private func gemma4TokenTypeIds(
     return tokenTypeIds
 }
 
+private func gemma4TextOnlyPromptTokens(_ input: LMInput) -> MLXArray {
+    let tokens = input.text.tokens
+    if tokens.ndim == 2, tokens.dim(0) == 1 {
+        return tokens[0]
+    }
+    if tokens.ndim == 1 {
+        return tokens
+    }
+    return tokens.flattened()
+}
+
+private func gemma4PrepareTextOnly(
+    _ input: LMInput,
+    cache: [any KVCache],
+    windowSize: Int?,
+    languageModel: Gemma4TextLanguageModel
+) -> PrepareResult {
+    let prefillStepSize = max(windowSize ?? 512, 1)
+    let y = gemma4TextOnlyPromptTokens(input).expandedDimensions(axis: 0)
+    let convertedCache = cache.map { $0 }
+    let totalPositions = y.dim(1)
+
+    var processed = 0
+    while totalPositions - processed > 1 {
+        let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+        _ = languageModel(
+            y[0..., processed ..< (processed + chunkLength)],
+            cache: convertedCache
+        )
+        asyncEval(cache)
+        processed += chunkLength
+    }
+
+    eval(cache)
+    return .logits(languageModel(y[0..., processed...], cache: convertedCache))
+}
+
 private func gemma4BlockSequenceIdsForMask(_ tokenTypeIds: MLXArray) -> MLXArray {
     let isVision = (tokenTypeIds .== 1) | (tokenTypeIds .== 2)
     let sequenceLength = isVision.dim(1)
@@ -1201,9 +1238,17 @@ final class Gemma4TextBackbone: Module {
                 } else {
                     false
                 }
+            let hasVisualTokens =
+                if let tokenTypeIds {
+                    ((tokenTypeIds .== 1) | (tokenTypeIds .== 2))
+                        .asType(.int32).sum().item(Int.self) > 0
+                } else {
+                    false
+                }
             let useBidirectionalVision =
                 config.useBidirectionalAttention == "vision"
                 && tokenTypeIds != nil
+                && hasVisualTokens
                 && !hasAudioTokens
                 && h0.dim(1) > 1
 
@@ -1349,8 +1394,8 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         cache: [KVCache]? = nil,
         inputsEmbeds: MLXArray? = nil,
         perLayerInputs: MLXArray? = nil,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         tokenTypeIds: MLXArray? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         emitDrafterState: Bool = false
     ) -> LMOutput {
         let (hidden, sharedKV) = model(
@@ -1383,11 +1428,30 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let firstKVSharedLayer = config.hiddenLayers - config.numKVSharedLayers
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count + 1)
 
         for (key, value) in weights {
             if key.contains("rotary_emb") {
+                continue
+            }
+            // Drop redundant k_proj/v_proj/k_norm for KV-shared layers: they reuse an
+            // earlier layer's K/V and own no K projection or K norm, so the module tree
+            // has none. QAT checkpoints already omit these; some (PTQ) checkpoints still
+            // ship them, and keeping them would be an unexpected weight.
+            // Scope: text backbone only — the vision/audio towers share the
+            // `layers.N.self_attn.{k,v}_proj` naming, so without these guards the drop
+            // would amputate tower layers >= firstKVSharedLayer.
+            if firstKVSharedLayer > 0,
+                !key.contains("vision_tower"),
+                !key.contains("audio_tower"),
+                key.contains("self_attn.k_proj")
+                    || key.contains("self_attn.v_proj")
+                    || key.contains("self_attn.k_norm"),
+                let layerIdx = Self.decoderLayerIndex(in: key),
+                layerIdx >= firstKVSharedLayer
+            {
                 continue
             }
 
@@ -1441,6 +1505,13 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         }
 
         return sanitized
+    }
+
+    /// Extract `N` from a weight key shaped like `…layers.N.…`, else nil.
+    private static func decoderLayerIndex(in key: String) -> Int? {
+        guard let range = key.range(of: "layers.") else { return nil }
+        let digits = key[range.upperBound...].prefix { $0.isNumber }
+        return Int(digits)
     }
 }
 
@@ -1996,36 +2067,14 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         let convertedCache = cache.map { $0 }
-        let prefillStepSize = windowSize ?? 512
         if let imagePixels = input.image?.pixels {
-            let (allEmbeds, allPerLayerInputs) = try getInputEmbeddings(
+            let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens, pixelValues: imagePixels)
-            // Prefill the merged image+text embeddings (and the aligned
-            // per-layer inputs) in windowSize-sized chunks; the final
-            // position yields the first-token logits. Matches
-            // LLMModel.prepare and #297. asyncEval lets the CPU build
-            // chunk N+1's graph while the GPU evaluates chunk N.
-            let totalPositions = allEmbeds.dim(1)
-            var processed = 0
-            while totalPositions - processed > 1 {
-                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-                let range = processed ..< (processed + chunkLength)
-                _ = languageModel(
-                    nil,
-                    cache: convertedCache,
-                    inputsEmbeds: allEmbeds[0..., range, 0...],
-                    perLayerInputs: allPerLayerInputs.map { $0[0..., range, 0..., 0...] }
-                )
-                asyncEval(cache)
-                processed += chunkLength
-            }
-            // Single sync after the loop to flush any remaining async work.
-            eval(cache)
             let result = languageModel(
                 nil,
                 cache: convertedCache,
-                inputsEmbeds: allEmbeds[0..., processed..., 0...],
-                perLayerInputs: allPerLayerInputs.map { $0[0..., processed..., 0..., 0...] },
+                inputsEmbeds: inputsEmbeds,
+                perLayerInputs: perLayerInputs,
                 tokenTypeIds: gemma4TokenTypeIds(
                     inputIds: input.text.tokens,
                     imageTokenId: config.imageTokenId,
@@ -2034,27 +2083,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             )
             return .logits(result)
         } else {
-            // Text-only path: chunk raw tokens (per-layer inputs are derived
-            // from each chunk's tokens inside the backbone).
-            var tokens = input.text.tokens
-            if tokens.ndim == 1 {
-                tokens = tokens.expandedDimensions(axis: 0)
-            }
-            let totalPositions = tokens.dim(1)
-            var processed = 0
-            while totalPositions - processed > 1 {
-                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-                _ = languageModel(
-                    tokens[0..., processed ..< (processed + chunkLength)],
-                    cache: convertedCache
-                )
-                asyncEval(cache)
-                processed += chunkLength
-            }
-            // Single sync after the loop to flush any remaining async work.
-            eval(cache)
-            let result = languageModel(tokens[0..., processed...], cache: convertedCache)
-            return .logits(result)
+            return gemma4PrepareTextOnly(
+                input, cache: convertedCache, windowSize: windowSize, languageModel: languageModel)
         }
     }
 
@@ -2496,6 +2526,11 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        if input.image == nil, input.video == nil, input.audio == nil {
+            return gemma4PrepareTextOnly(
+                input, cache: cache, windowSize: windowSize, languageModel: languageModel)
+        }
+
         let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
             inputIds: input.text.tokens,
             pixelValues: input.image?.pixels,
@@ -2553,13 +2588,14 @@ public struct Gemma4MessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        var dictionary: MLXLMCommon.Message
         if message.role == .system {
-            [
+            dictionary = [
                 "role": message.role.rawValue,
                 "content": message.content,
             ]
         } else {
-            [
+            dictionary = [
                 "role": message.role.rawValue,
                 "content": message.images.map { _ in
                     ["type": "image"]
@@ -2572,6 +2608,8 @@ public struct Gemma4MessageGenerator: MessageGenerator {
                     ],
             ]
         }
+        addToolMetadata(to: &dictionary, for: message)
+        return dictionary
     }
 }
 
@@ -2713,6 +2751,9 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
 
 public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     public let processorClass: String
+    public let doResize: Bool
+    public let doRescale: Bool
+    public let rescaleFactor: CGFloat
     public let doNormalize: Bool
     public let imageMean: [CGFloat]
     public let imageStd: [CGFloat]
@@ -2731,6 +2772,9 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     public let eoiTokenId: Int?
 
     private struct ImageProcessorConfiguration: Decodable, Sendable {
+        let doResize: Bool?
+        let doRescale: Bool?
+        let rescaleFactor: CGFloat?
         let doNormalize: Bool?
         let imageMean: [CGFloat]?
         let imageStd: [CGFloat]?
@@ -2742,6 +2786,9 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         let size: Gemma3ProcessorConfiguration.ImageSize?
 
         enum CodingKeys: String, CodingKey {
+            case doResize = "do_resize"
+            case doRescale = "do_rescale"
+            case rescaleFactor = "rescale_factor"
             case doNormalize = "do_normalize"
             case imageMean = "image_mean"
             case imageStd = "image_std"
@@ -2757,6 +2804,9 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
         case imageProcessor = "image_processor"
+        case doResize = "do_resize"
+        case doRescale = "do_rescale"
+        case rescaleFactor = "rescale_factor"
         case doNormalize = "do_normalize"
         case imageMean = "image_mean"
         case imageStd = "image_std"
@@ -2784,6 +2834,18 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         processorClass =
             try c.decodeIfPresent(String.self, forKey: CodingKeys.processorClass)
             ?? "Gemma4UnifiedProcessor"
+        doResize =
+            try c.decodeIfPresent(Bool.self, forKey: CodingKeys.doResize)
+            ?? imageProcessor?.doResize
+            ?? true
+        doRescale =
+            try c.decodeIfPresent(Bool.self, forKey: CodingKeys.doRescale)
+            ?? imageProcessor?.doRescale
+            ?? true
+        rescaleFactor =
+            try c.decodeIfPresent(CGFloat.self, forKey: CodingKeys.rescaleFactor)
+            ?? imageProcessor?.rescaleFactor
+            ?? (1.0 / 255.0)
         doNormalize =
             try c.decodeIfPresent(Bool.self, forKey: CodingKeys.doNormalize)
             ?? imageProcessor?.doNormalize
@@ -2863,6 +2925,41 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         }
         return CGSize(width: budgetSide, height: budgetSide)
     }
+
+    public func aspectRatioPreservingSize(for imageSize: CGSize) throws -> CGSize {
+        let width = max(1, Int(ceil(imageSize.width)))
+        let height = max(1, Int(ceil(imageSize.height)))
+        let sideMultiple = max(1, patchSize * poolingKernelSize)
+        let maxTokens = max(1, maxSoftTokens)
+
+        let targetPixels = Double(maxTokens * sideMultiple * sideMultiple)
+        let resizeFactor = sqrt(targetPixels / Double(width * height))
+
+        var targetWidth =
+            Int(floor(Double(width) * resizeFactor / Double(sideMultiple))) * sideMultiple
+        var targetHeight =
+            Int(floor(Double(height) * resizeFactor / Double(sideMultiple))) * sideMultiple
+
+        if targetWidth == 0 && targetHeight == 0 {
+            throw VLMError.processing("Image is too small to resize for Gemma4 unified vision.")
+        } else if targetHeight == 0 {
+            targetHeight = sideMultiple
+            targetWidth = max(
+                sideMultiple,
+                min(
+                    maxTokens * sideMultiple,
+                    Int(floor(Double(width) / Double(height))) * sideMultiple))
+        } else if targetWidth == 0 {
+            targetWidth = sideMultiple
+            targetHeight = max(
+                sideMultiple,
+                min(
+                    maxTokens * sideMultiple,
+                    Int(floor(Double(height) / Double(width))) * sideMultiple))
+        }
+
+        return CGSize(width: targetWidth, height: targetHeight)
+    }
 }
 
 public struct Gemma4UnifiedProcessor: UserInputProcessor {
@@ -2916,27 +3013,39 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
         pixels: MLXArray, positionIds: MLXArray, tokenCounts: [Int], frames: [THW]
     ) {
-        let targetSize = config.fixedSize
         var patchRows: [MLXArray] = []
         var positionRows: [MLXArray] = []
         var tokenCounts: [Int] = []
         var frames: [THW] = []
 
         for image in images {
-            var userProcessing = processing ?? UserInput.Processing()
-            userProcessing.resize = targetSize
-
-            let processedImage = MediaProcessing.apply(image, processing: userProcessing)
+            let processedImage = MediaProcessing.apply(image, processing: processing)
             let srgbImage = MediaProcessing.inSRGBToneCurveSpace(processedImage)
-            let resizedImage = MediaProcessing.resampleBicubic(srgbImage, to: targetSize)
-            let finalImage =
-                if config.doNormalize {
-                    MediaProcessing.normalize(
-                        resizedImage, mean: config.imageMeanTuple, std: config.imageStdTuple)
+            let resizedImage =
+                if config.doResize {
+                    try MediaProcessing.resampleBicubic(
+                        srgbImage,
+                        to: config.aspectRatioPreservingSize(for: srgbImage.extent.size))
                 } else {
-                    resizedImage
+                    srgbImage
                 }
-            let pixelValues = MediaProcessing.asMLXArray(finalImage)
+
+            var pixelValues = MediaProcessing.asMLXArray(resizedImage)
+            let rescaleMultiplier = Float(config.doRescale ? config.rescaleFactor * 255 : 255)
+            if rescaleMultiplier != 1 {
+                pixelValues = pixelValues * MLXArray(rescaleMultiplier, dtype: pixelValues.dtype)
+            }
+            if config.doNormalize {
+                let mean = MLXArray(
+                    config.imageMean.map { Float($0) }, [1, config.imageMean.count, 1, 1]
+                )
+                .asType(pixelValues.dtype)
+                let std = MLXArray(
+                    config.imageStd.map { Float($0) }, [1, config.imageStd.count, 1, 1]
+                )
+                .asType(pixelValues.dtype)
+                pixelValues = (pixelValues - mean) / std
+            }
             let (patches, positions, tokenCount, frame) = patchify(pixelValues)
             patchRows.append(patches)
             positionRows.append(positions)

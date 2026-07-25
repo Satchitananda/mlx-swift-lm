@@ -17,6 +17,14 @@ public protocol BaseLanguageModel: Module {
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
 }
 
+/// Optional metadata a model wants written into converted safetensors.
+///
+/// Model-specific metadata lets future loaders distinguish transformed MLX-native
+/// checkpoints from original upstream checkpoints without relying only on tensor shapes.
+public protocol ModelConversionMetadataProvider {
+    var modelConversionMetadata: [String: String] { get }
+}
+
 extension BaseLanguageModel {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
@@ -87,6 +95,15 @@ public struct LMInput {
             text indices: MLXArrayIndex..., stream stream: StreamOrDevice = .default
         ) -> Text {
             Text(tokens: tokens[indices, stream: stream], mask: mask)
+        }
+
+        /// Per-batch sequence lengths derived from the optional attention mask.
+        public var sequenceLengths: [Int]? {
+            if let mask {
+                return mask.asType(.int32).sum(axis: -1).asArray(Int.self)
+            }
+            guard tokens.ndim == 2 else { return nil }
+            return Array(repeating: tokens.dim(1), count: tokens.dim(0))
         }
     }
 
