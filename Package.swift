@@ -36,8 +36,14 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
+        // Sibling path dep — the SightRoll monorepo/release layout checks out our
+        // mlx-swift fork next to this package (upstream declares
+        // ml-explore/mlx-swift >= 0.31.4; the sibling pin satisfies it).
         .package(path: "../mlx-swift"),
-        .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
+        // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
+        // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
+        // source compile of swift-syntax.
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
     ],
     targets: [
         .target(
