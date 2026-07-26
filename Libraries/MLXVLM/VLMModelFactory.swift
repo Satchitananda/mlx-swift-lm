@@ -364,8 +364,10 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load generation_config.json for EOS token IDs and recommended sampling params.
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        // Load EOS token IDs from config.json (nested text configs included), with
+        // optional override from generation_config.json — which also carries the
+        // recommended sampling params we surface via ModelContext.
+        var eosTokenIds = baseConfig.effectiveEOSTokenIds
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let parsedGenerationConfig: GenerationConfigFile? =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
