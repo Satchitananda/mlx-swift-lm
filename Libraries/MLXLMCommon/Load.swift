@@ -61,6 +61,7 @@ public func loadWeights(
     weights = model.sanitize(weights: weights, metadata: metadata)
 
     // quantize if needed
+    var builtMXFP8Layer = false
     if quantization != nil || perLayerQuantization != nil {
         quantize(
             model: model,
@@ -82,6 +83,7 @@ public func loadWeights(
                 // Use the explicit initializer with biases:nil; weight/scales are
                 // overwritten by model.update(parameters:) with the real checkpoint data.
                 if mode == .mxfp8, let linear = layer as? Linear {
+                    builtMXFP8Layer = true
                     let w = linear.weight
                     let dummyScales = MLXArray.zeros([w.dim(0), max(1, w.dim(1) / groupSize)])
                     return QuantizedLinear(
@@ -96,12 +98,15 @@ public func loadWeights(
 
     // apply the loaded weights
     //
-    // Use .noUnusedKeys only (not .all) because pre-quantized mxfp8 models have a
-    // different weight layout than the affine QuantizedLinear created by quantize(model:)
-    // above (shapes are reconciled via _updateInternal once the real data is applied).
-    // .noUnusedKeys still catches any unexpected extra keys in the checkpoint.
+    // Strict verification (.all) by default — a checkpoint whose packed shapes don't
+    // match the quantized modules must fail loudly, not decode as garbage (upstream
+    // regression #395). Relax to .noUnusedKeys ONLY when an mxfp8 layer was built:
+    // pre-quantized mxfp8 models carry a different weight layout than the affine
+    // QuantizedLinear placeholder above, and their shapes are reconciled via
+    // _updateInternal once the real data is applied.
     let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.noUnusedKeys])
+    try model.update(
+        parameters: parameters, verify: builtMXFP8Layer ? [.noUnusedKeys] : [.all])
 
     eval(model)
 }

@@ -1,0 +1,72 @@
+name: Integration Tests
+
+# Heavy integration tests (Hugging Face model downloads, Metal GPU, long-running).
+# Kept out of the PR path so they never block merges
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration_tests:
+    if: github.repository == 'ml-explore/mlx-swift-lm'
+    runs-on: [self-hosted, macos]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          # The FoundationModels integration tests only build against the macOS 27
+          # SDK (canImport(FoundationModels, _version: 2)); on the macOS 26 SDK the
+          # MLXFoundationModels adapter compiles out and those tests are skipped.
+          # Prefer Xcode 27 when the runner has it so the full suite runs; otherwise
+          # fall back to the default toolchain and run the SDK-agnostic tests.
+          dev=""
+          for app in /Applications/Xcode_27*.app /Applications/Xcode-27*.app /Applications/Xcode.app; do
+            [ -d "$app" ] || continue
+            v=$("$app/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -1)
+            case "$v" in "Xcode 27"*) dev="$app/Contents/Developer" ;; esac
+            [ -n "$dev" ] && break
+          done
+          if [ -n "$dev" ]; then
+            echo "Using Xcode 27 at $dev (full suite, incl. FoundationModels tests)"
+            echo "DEVELOPER_DIR=$dev" >> "$GITHUB_ENV"
+          else
+            echo "Xcode 27 not found; using default $(xcode-select -p)."
+            echo "FoundationModels tests will be compiled out (macOS 27 SDK required)."
+          fi
+
+      - name: Verify MetalToolchain installed
+        shell: bash
+        run: xcodebuild -showComponent MetalToolchain
+
+      - name: Run IntegrationTesting tests (Xcode, macOS)
+        shell: sh
+        run: |
+          xcodebuild -version
+          swift --version
+          # Model-dependent tests must run in a single xctest worker: concurrent
+          # workers race on the shared on-disk Hugging Face cache. Disable parallel
+          # testing (see IntegrationTestingTests/.../Support/FMTestHelpers.swift).
+          xcodebuild test \
+            -project IntegrationTesting/IntegrationTesting.xcodeproj \
+            -scheme IntegrationTesting \
+            -destination 'platform=macOS' \
+            -parallel-testing-enabled NO \
+            -skipPackagePluginValidation \
+            -resultBundlePath IntegrationTesting.xcresult
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: |
+            IntegrationTesting.xcresult
+            ~/Library/Logs/DiagnosticReports/*
+          retention-days: 7
