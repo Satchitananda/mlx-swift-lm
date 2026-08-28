@@ -134,6 +134,28 @@ final class StopStringTests: XCTestCase {
         }
     }
 
+    func testGenerateTaskUsesConfiguredStopStringsWhenNoOverrideIsProvided() async {
+        let result = await runGenerateTask(
+            stopStringsOverride: nil,
+            configuredStopStrings: ["<turn|>"]
+        )
+
+        XCTAssertEqual(result.text, #"result: {"voiceover":"keep "#)
+        XCTAssertEqual(result.consumedTokens, 3)
+        XCTAssertEqual(result.stopReason, .stop)
+    }
+
+    func testGenerateTaskExplicitEmptyStopStringsKeepsStopTextInsideJSONString() async {
+        let result = await runGenerateTask(
+            stopStringsOverride: [],
+            configuredStopStrings: ["<turn|>"]
+        )
+
+        XCTAssertEqual(result.text, #"result: {"voiceover":"keep <turn|> inside"}"#)
+        XCTAssertEqual(result.consumedTokens, 4)
+        XCTAssertEqual(result.stopReason, .length)
+    }
+
     func testStopStringFilterFlushesBufferedSuffixWhenNoStopArrives() {
         var filter = StopStringFilter(stopStrings: ["<stop>"])
 
@@ -183,6 +205,44 @@ final class StopStringTests: XCTestCase {
         XCTAssertTrue(configuration.effectiveStopStrings.contains(token), file: file, line: line)
         XCTAssertNil(configuration.stopStrings, file: file, line: line)
     }
+}
+
+private func runGenerateTask(
+    stopStringsOverride: Set<String>?,
+    configuredStopStrings: Set<String>
+) async -> (text: String, consumedTokens: Int, stopReason: GenerateStopReason?) {
+    let tokenizer = DeterministicStopStringTokenizer(decoding: [
+        1: #"result: {"voiceover":"keep "#,
+        2: "<tur",
+        3: "n|>",
+        4: #" inside"}"#,
+    ])
+    let configuration = ModelConfiguration(
+        id: "test",
+        stopStrings: configuredStopStrings
+    )
+    let (stream, task) = generateTask(
+        promptTokenCount: 0,
+        modelConfiguration: configuration,
+        tokenizer: tokenizer,
+        iterator: FixedTokenIterator(tokens: [1, 2, 3, 4]),
+        stopStrings: stopStringsOverride
+    )
+
+    var chunks: [String] = []
+    var info: GenerateCompletionInfo?
+    for await generation in stream {
+        switch generation {
+        case .chunk(let text):
+            chunks.append(text)
+        case .info(let completion):
+            info = completion
+        case .toolCall:
+            XCTFail("plain response unexpectedly parsed as a tool call")
+        }
+    }
+    await task.value
+    return (chunks.joined(), info?.generationTokenCount ?? 0, info?.stopReason)
 }
 
 private func runStopStringLoop(
@@ -245,5 +305,22 @@ private struct DeterministicStopStringTokenizer: Tokenizer {
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
         []
+    }
+}
+
+private struct FixedTokenIterator: TokenIteratorProtocol {
+    let tokens: [Int]
+    var index = 0
+    var tokenCount = 0
+    var maxTokens: Int? { tokens.count }
+    let promptPrefillTime: TimeInterval = 0
+
+    mutating func next() -> Int? {
+        guard index < tokens.count else { return nil }
+        defer {
+            index += 1
+            tokenCount += 1
+        }
+        return tokens[index]
     }
 }
