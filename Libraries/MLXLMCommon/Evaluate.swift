@@ -1425,7 +1425,7 @@ public func generate(
 /// * Important: if the stream is terminated early (e.g. break from the loop) computation will continue
 /// using the model, parameters, KVCache, etc. for some time (typically a few ms).  This is typically OK for
 /// one-shot calls, but for "chat session" type calls consider using
-/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:tools:)``
+/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:stopStrings:tools:)``
 /// so that the end of the generation task can be observed.
 ///
 /// - Parameters:
@@ -1594,6 +1594,9 @@ public func generate(
 ///   - tokenizer: tokenizer (for EOS id, unknown token id, and detokenization)
 ///   - iterator: a token iterator conforming to ``TokenIteratorProtocol``
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+///   - stopStrings: Optional decoded stop-string override. Pass an empty set when
+///     another layer, such as a grammar matcher, owns the complete stop contract.
+///     `nil` preserves the model configuration's effective stop strings.
 ///   - tools: Optional tool schemas used to parse tool-call arguments into their declared types.
 /// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
 public func generateTask<TOKEN: TokenIteratorProtocol>(
@@ -1602,6 +1605,7 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
     tokenizer: Tokenizer,
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
+    stopStrings: Set<String>? = nil,
     tools: [[String: any Sendable]]? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
@@ -1612,7 +1616,7 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
-            stopStrings: modelConfiguration.effectiveStopStrings,
+            stopStrings: stopStrings ?? modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
             tools: tools
         )
