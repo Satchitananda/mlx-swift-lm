@@ -32,10 +32,11 @@ unsupported caches; the production `MLXVLM` target is not supported. SightRoll's
 grammar processor also lacks an independent state-copy contract for speculative
 branches. DFlash2 remains disabled in the four-model SightRoll benchmark.
 
-Qwen3.8 checkpoints use the `qwen3_5` architecture. SightRoll explicitly disables
-thinking at its structured/visual prompt boundary, pins checkpoint revisions,
-and measures normal production decoding. Benchmark outcomes do not automatically
-change production model defaults.
+Qwen3.8 checkpoints use the `qwen3_5` architecture. SightRoll's baseline model
+comparison disables thinking at its structured/visual prompt boundary, pins
+checkpoint revisions, and measures standard decoding. The Director's explicit
+reasoning controls are a separate configuration. Benchmark outcomes do not
+automatically change production model defaults.
 
 ## Validation
 
