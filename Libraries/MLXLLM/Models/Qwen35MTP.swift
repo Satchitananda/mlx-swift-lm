@@ -249,7 +249,8 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             weights: weights,
             mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
             numExperts: configuration.numExperts,
-            shiftNormWeights: !preconvertedNorms
+            shiftNormWeights: !preconvertedNorms,
+            standaloneCheckpoint: preconvertedNorms
         )
     }
 

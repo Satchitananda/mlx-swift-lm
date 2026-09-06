@@ -8,9 +8,21 @@ package func qwenMTPSanitizeWeights(
     weights: [String: MLXArray],
     mtpNumHiddenLayers: Int,
     numExperts: Int,
-    shiftNormWeights: Bool
+    shiftNormWeights: Bool,
+    standaloneCheckpoint: Bool = false
 ) -> [String: MLXArray] {
-    var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    // Converted standalone drafters may store the predictor at the root
+    // (fc.*, layers.*, norm.*), without the full model's mtp wrapper. Only
+    // standalone model registrations admit that layout. Never reinterpret
+    // a full target checkpoint's bare weights as drafter parameters, or mix
+    // them into an already namespaced MTP checkpoint.
+    let source: [String: MLXArray]
+    if standaloneCheckpoint, !weights.keys.contains(where: { $0.hasPrefix("mtp.") }) {
+        source = Dictionary(uniqueKeysWithValues: weights.map { ("mtp." + $0.key, $0.value) })
+    } else {
+        source = weights
+    }
+    var sanitized = source.filter { key, _ in key.hasPrefix("mtp.") }
 
     for layer in 0 ..< max(mtpNumHiddenLayers, 1) {
         let prefix = "mtp.layers.\(layer).mlp"

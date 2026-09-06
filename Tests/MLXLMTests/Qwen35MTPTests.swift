@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import Testing
 
 @testable import MLXLLM
@@ -375,6 +376,59 @@ struct Qwen35MTPMetalTests {
 
 @Suite(.serialized)
 struct Qwen35MTPRegistrationTests {
+    @Test(arguments: [false, true], [false, true])
+    func standaloneCheckpointLoadsConvertedWeights(vision: Bool, prefixed: Bool) async throws {
+        await MLXLLM.Qwen35TextMTPRegistration.register()
+        await MLXVLM.Qwen35VLMMTPRegistration.register()
+        let registry =
+            vision ? MTPDrafterTypeRegistry.visionLanguage : MTPDrafterTypeRegistry.shared
+        let config = Data(qwen35StandaloneMTPConfigJSON().utf8)
+        let reference = try await registry.createModel(
+            configuration: config, modelType: "qwen3_5_mtp")
+        // Exercise packed tensors and their scales/biases as well as converted
+        // norms, with the standalone key layout used by the published drafter.
+        quantize(model: reference, groupSize: 32, bits: 4, filter: { path, _ in path == "mtp.fc" })
+        let expected = Dictionary(uniqueKeysWithValues: reference.parameters().flattened())
+        let arrays = Dictionary(
+            uniqueKeysWithValues: expected.map { key, value in
+                (prefixed ? key : String(key.dropFirst("mtp.".count)), value)
+            })
+        let directory = FileManager.default.temporaryDirectory
+            .appending(component: "qwen-mtp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try save(arrays: arrays, url: directory.appending(component: "model.safetensors"))
+
+        let loaded = try await registry.createModel(configuration: config, modelType: "qwen3_5_mtp")
+        try await loadWeights(
+            modelDirectory: directory, model: loaded,
+            quantization: .init(groupSize: 32, bits: 4))
+        let actual = Dictionary(uniqueKeysWithValues: loaded.parameters().flattened())
+        #expect(Set(actual.keys) == Set(expected.keys))
+        #expect(actual["mtp.fc.scales"] != nil)
+        for (key, value) in expected {
+            let loadedValue = try #require(actual[key])
+            #expect(allClose(loadedValue, value, rtol: 0, atol: 0).item(Bool.self))
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func fullCheckpointDoesNotTreatBareTargetWeightsAsMTP(vision: Bool) throws {
+        let drafter: any MTPDrafterModel
+        if vision {
+            let config = try JSONDecoder().decode(
+                MLXVLM.Qwen35Configuration.self,
+                from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+            drafter = MLXVLM.Qwen35VLMNextNDraftModel(config)
+        } else {
+            let config = try JSONDecoder().decode(
+                MLXLLM.Qwen35TextConfiguration.self,
+                from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+            drafter = MLXLLM.Qwen35MTPDraftModel(config)
+        }
+        #expect(drafter.sanitize(weights: ["norm.weight": MLXArray.ones([16])]).isEmpty)
+    }
+
     @Test
     func registrationsCreateTextAndVLMDrafters() async throws {
         await MLXLLM.Qwen35TextMTPRegistration.register()
