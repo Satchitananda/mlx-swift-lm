@@ -37,6 +37,30 @@ thinking at its structured/visual prompt boundary, pins checkpoint revisions,
 and measures normal production decoding. Benchmark outcomes do not automatically
 change production model defaults.
 
+## Standalone MTP weight compatibility
+
+The `qwen3_5_mtp` and `qwen3_8_mtp` standalone drafter registrations accept
+converted checkpoints with either bare predictor keys (`fc.*`, `layers.*`,
+`norm.*`, `pre_fc_norm_*`) or `mtp.`-prefixed keys. Select the text registry
+through `Qwen35TextMTPRegistration.register()` or the vision-language registry
+through `Qwen35VLMMTPRegistration.register()` for the corresponding target.
+The existing weight loader handles both layouts without editing checkpoint files.
+
+Bare keys receive the `mtp.` namespace only for standalone registrations when
+no prefixed keys exist. Already prefixed checkpoints keep their existing
+filtering; full target checkpoints never reinterpret bare target weights as MTP
+parameters. Converted norm values and quantized weights, scales and biases are
+preserved. This compatibility fix does not enable production MTP or change
+model defaults, sampling, block size or speculative decoding algorithms.
+
+`Qwen35MTPRegistrationTests` writes tiny synthetic quantized safetensors into
+unique temporary directories and loads them through the production weight
+loader. Its four text/vision and bare/prefixed combinations verify exact
+parameter equality; both bare variants reproduced missing-parameter failures
+before the fix and pass afterward. Two further cases verify that full text and
+vision checkpoints reject bare target weights. Fixtures require no downloaded
+checkpoint or user data and remove their temporary directories afterward.
+
 ## Validation
 
 On the M5 Max host, a fresh scratch build and serial full-precision tests passed:
@@ -48,7 +72,13 @@ MLX_ENABLE_TF32=0 swift test --scratch-path /private/tmp/qwen38-lm-clean \
   --skip-build --no-parallel
 ```
 
-Result: 611 XCTest passes, one skip, and 833 Swift Testing passes across 77 suites.
+For the standalone loading fix `600821e`, the 2026-09-06 full run reported
+612 XCTest executions: 611 passes, one skipped real-checkpoint benchmark and
+zero failures. Swift Testing reported 835 tests across 77 suites with zero
+failures; the log also explicitly lists the existing disabled three-test
+`ConstraintCachingTests` suite, whose required XGrammar fork API is unavailable
+in the vendored version. These counts are dated evidence, not a claim that every
+optional integration test ran.
 The build used the sibling MLX fork at
 `de8a9179a1cd7f68b6322d09771e9db39cb73cff`.
 

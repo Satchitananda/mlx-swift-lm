@@ -22,6 +22,7 @@ For some example applications and tools that use MLX Swift LM, check out [MLX Sw
 
 Developers can use these examples in their own programs -- just import the swift package!
 
+- [Fork Qwen3.8 integration and standalone MTP compatibility](QWEN38_INTEGRATION.md)
 - [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
 - [Techniques for developing in mlx-swift-lm](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/developing)
 - [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon): Common API for LLM and VLM
