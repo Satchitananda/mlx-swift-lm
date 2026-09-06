@@ -541,6 +541,123 @@ enum TurboQuantMetalKernels {
         }
         """
 
+    /// TurboFlashAttention bounded decode path: score, online softmax, value
+    /// accumulation, normalization, and optional inverse value rotation in one
+    /// dispatch. One SIMD group owns one query row and walks the cache in token
+    /// order. This avoids allocating pass-1 partials and launching pass 2 when
+    /// the context is short enough that cross-block parallelism is unnecessary.
+    ///
+    /// Grid: (32, totalQueries, 1)
+    /// Threadgroup: (32, 1, 1)
+    ///
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth,
+    ///                  ValuePackedWidth, ApplyRotation
+    static let turboFlashSinglePassSource = """
+        const uint token_count = params[0];
+        const uint repeat_count = params[1];
+        constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
+        constexpr uint KEY_LEVELS = 1u << KeyBits;
+        constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
+        constexpr uint VAL_LEVELS = 1u << ValueBits;
+        constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+        uint lane = thread_position_in_grid.x;
+        uint q_idx = thread_position_in_grid.y;
+        uint kv_idx = q_idx / repeat_count;
+
+        float key_cb[KEY_LEVELS];
+        for (uint i = 0; i < KEY_LEVELS; i++) {
+            key_cb[i] = key_codebook[i];
+        }
+        float val_cb[VAL_LEVELS];
+        for (uint i = 0; i < VAL_LEVELS; i++) {
+            val_cb[i] = val_codebook[i];
+        }
+
+        float q_vals[DIMS_PER_LANE];
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            q_vals[i] = (d < Dim) ? q_rot[q_idx * Dim + d] : 0.0f;
+        }
+
+        float m = -INFINITY;
+        float l = 0.0f;
+        float o[DIMS_PER_LANE];
+        for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
+
+        for (uint t = 0; t < token_count; t++) {
+            const device uint32_t* k_packed_ptr =
+                key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
+            float k_norm = key_norms[kv_idx * token_count + t];
+
+            float dot_partial = 0.0f;
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                uint d = lane + i * 32;
+                if (d >= Dim) break;
+                uint bit_offset = d * KeyBits;
+                uint word_idx = bit_offset / 32;
+                uint shift = bit_offset % 32;
+                uint value = k_packed_ptr[word_idx] >> shift;
+                int spill = (int)shift + (int)KeyBits - 32;
+                if (spill > 0) {
+                    value |= k_packed_ptr[word_idx + 1] << ((uint)KeyBits - (uint)spill);
+                }
+                value &= KEY_MASK;
+                dot_partial += q_vals[i] * key_cb[value];
+            }
+            float score = simd_sum(dot_partial) * k_norm;
+
+            float new_m = max(m, score);
+            float exp_diff = exp(m - new_m);
+            float exp_score = exp(score - new_m);
+
+            const device uint32_t* v_packed_ptr =
+                val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+            float v_norm = val_norms[kv_idx * token_count + t];
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                uint d = lane + i * 32;
+                if (d >= Dim) break;
+                uint bit_offset = d * ValueBits;
+                uint word_idx = bit_offset / 32;
+                uint shift = bit_offset % 32;
+                uint value = v_packed_ptr[word_idx] >> shift;
+                int spill = (int)shift + (int)ValueBits - 32;
+                if (spill > 0) {
+                    value |= v_packed_ptr[word_idx + 1] << ((uint)ValueBits - (uint)spill);
+                }
+                value &= VAL_MASK;
+                o[i] = o[i] * exp_diff + exp_score * (val_cb[value] * v_norm);
+            }
+            l = l * exp_diff + exp_score;
+            m = new_m;
+        }
+
+        float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+        if (ApplyRotation != 0) {
+            threadgroup float shared_out[Dim];
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                uint d = lane + i * 32;
+                if (d < Dim) shared_out[d] = o[i] * inv_l;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                uint d = lane + i * 32;
+                if (d < Dim) {
+                    float acc = 0.0f;
+                    for (uint j = 0; j < Dim; j++) {
+                        acc += shared_out[j] * val_rotation[j * Dim + d];
+                    }
+                    output[q_idx * Dim + d] = acc;
+                }
+            }
+        } else {
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                uint d = lane + i * 32;
+                if (d < Dim) output[q_idx * Dim + d] = o[i] * inv_l;
+            }
+        }
+        """
+
     /// TurboFlashAttention Pass 1 (Causal): Per-block partial attention with causal masking.
     ///
     /// Same as turboFlashPass1Source but supports L>1 query chunks with causal masking.
@@ -1606,30 +1723,105 @@ enum TurboQuantKernelOps {
     nonisolated(unsafe) private static var flashPass1NR0Kernels: [String: MLXFast.MLXFastKernel] =
         [:]
     nonisolated(unsafe) private static var flashPass2Kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var flashSinglePassKernels: [String: MLXFast.MLXFastKernel] =
+        [:]
 
-    /// NR0: number of query rows processed per SIMD group in the multi-row amortized kernel.
-    ///
-    /// Ported from llama.cpp V2.1: each threadgroup loads K/V packed data once and reuses
-    /// it across NR0 queries. At NR0=2, the KV dequant cost is halved per query.
-    ///
-    /// NR0=2 is conservative, register pressure is ~24 extra floats per thread (for dim=128).
-    /// Apple M-series GPUs have 96 registers per thread (384 bytes), so this fits comfortably.
-    ///
-    /// Override via environment variable `TURBO_FLASH_NR0` (must be power of 2).
-    static let flashNR0: Int = {
+    /// Explicit NR0 override for profiling and device-specific tuning.
+    /// Values must be powers of two so query groups remain naturally aligned.
+    private static let flashNR0Override: Int? = {
         if let envValue = ProcessInfo.processInfo.environment["TURBO_FLASH_NR0"],
             let parsed = Int(envValue), parsed > 0, (parsed & (parsed - 1)) == 0
         {
             return parsed
         }
-        return 2  // default, conservative starting point
+        return nil
     }()
+
+    /// Choose the number of query rows processed by each SIMD group during decode.
+    ///
+    /// NR0=2 amortizes packed K/V decoding across two query rows and remains the
+    /// long-context default. Immediately above the single-dispatch ceiling,
+    /// however, that reuse does not repay the lost parallelism for small query
+    /// batches. Keep one row per group in the measured crossover region.
+    static func automaticFlashDecodeNR0(tokenCount: Int, totalQueries: Int, dim: Int) -> Int {
+        if tokenCount > flashSinglePassMaxTokens && tokenCount <= 256
+            && (16 ... 32).contains(totalQueries) && (dim == 64 || dim == 128)
+        {
+            return 1
+        }
+        return 2
+    }
+
+    private static func flashDecodeNR0(tokenCount: Int, totalQueries: Int, dim: Int) -> Int {
+        flashNR0Override
+            ?? automaticFlashDecodeNR0(
+                tokenCount: tokenCount, totalQueries: totalQueries, dim: dim)
+    }
 
     /// Default block size for TurboFlashAttention two-pass approach.
     /// Each SIMD group processes this many tokens per block.
     /// Tuned for M1 Max via sweep: B=64 wins or ties at all token counts (512-8192+).
     /// Smaller blocks = more parallelism but more pass-2 merge work.
     static let flashBlockSize = 64
+
+    /// Short-context ceiling for the single-dispatch decode path. Longer
+    /// contexts retain the established block-parallel two-pass implementation.
+    static let flashSinglePassMaxTokens = 128
+
+    private static func dispatchFlashSinglePass(
+        rotatedQueries: MLXArray,
+        keyPacked: MLXArray, keyNorms: MLXArray, keyCodebook: MLXArray,
+        valPacked: MLXArray, valNorms: MLXArray, valCodebook: MLXArray,
+        tokenCount: Int, repeatCount: Int,
+        keyBits: Int, valueBits: Int, dim: Int,
+        valRotation: MLXArray?
+    ) -> MLXArray {
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let appliesRotation = valRotation != nil
+        let key = "flash_single_\(keyBits)_\(valueBits)_\(dim)_\(appliesRotation)"
+        let kernel: MLXFast.MLXFastKernel
+        lock.lock()
+        if let cached = flashSinglePassKernels[key] {
+            kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let k = MLXFast.metalKernel(
+                name: "turbo_flash_single_\(keyBits)_\(valueBits)_\(dim)_\(appliesRotation)",
+                inputNames: [
+                    "q_rot", "key_packed", "key_norms", "key_codebook",
+                    "val_packed", "val_norms", "val_codebook", "val_rotation", "params",
+                ],
+                outputNames: ["output"],
+                source: TurboQuantMetalKernels.turboFlashSinglePassSource,
+                ensureRowContiguous: true
+            )
+            lock.lock()
+            flashSinglePassKernels[key] = k
+            lock.unlock()
+            kernel = k
+        }
+
+        let totalQ = rotatedQueries.dim(0)
+        let params = MLXArray([UInt32(tokenCount), UInt32(repeatCount)])
+        let rotation = valRotation.map(f32) ?? MLXArray.zeros([1])
+        return kernel(
+            [
+                f32(rotatedQueries), keyPacked, f32(keyNorms), f32(keyCodebook),
+                valPacked, f32(valNorms), f32(valCodebook), rotation, params,
+            ],
+            template: [
+                ("KeyBits", keyBits), ("ValueBits", valueBits),
+                ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
+                ("ApplyRotation", appliesRotation ? 1 : 0),
+            ],
+            grid: (32, totalQ, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[totalQ, dim]],
+            outputDTypes: [.float32]
+        )[0]
+    }
 
     /// Shared pass 1 dispatch, used by both causal and non-causal variants.
     private static func dispatchFlashPass1(
@@ -2128,12 +2320,39 @@ enum TurboQuantKernelOps {
         valueBits: Int,
         dim: Int,
         valRotation: MLXArray? = nil,
-        blockSize: Int? = nil
+        blockSize: Int? = nil,
+        singleDispatch: Bool? = nil,
+        nr0: Int? = nil
     ) -> MLXArray {
+        // An explicit block size is used by block-sweep callers and therefore
+        // always selects the two-pass implementation. The optional override is
+        // internal test/benchmark plumbing; normal callers use the conservative
+        // context ceiling above.
+        // `nr0` is also internal test/benchmark plumbing for exact A/B comparisons.
+        let kernelSupportsSingleDispatch =
+            tokenCount > 0
+            && (2 ... 4).contains(keyBits) && (2 ... 4).contains(valueBits)
+            && dim > 0 && dim <= 256 && blockSize == nil
+        let defaultSingleDispatch =
+            kernelSupportsSingleDispatch && tokenCount <= flashSinglePassMaxTokens
+        let useSingleDispatch =
+            singleDispatch.map { $0 && kernelSupportsSingleDispatch } ?? defaultSingleDispatch
+        if useSingleDispatch {
+            return dispatchFlashSinglePass(
+                rotatedQueries: rotatedQueries,
+                keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+                valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+                tokenCount: tokenCount, repeatCount: repeatCount,
+                keyBits: keyBits, valueBits: valueBits, dim: dim,
+                valRotation: valRotation)
+        }
+
         let blockSize = blockSize ?? flashBlockSize
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
-        let nr0 = flashNR0
+        let nr0 =
+            nr0
+            ?? flashDecodeNR0(tokenCount: tokenCount, totalQueries: totalQ, dim: dim)
 
         // Use NR0 multi-row kernel when totalQ is evenly divisible by NR0 and NR0 > 1.
         // Falls back to NR0=1 (original kernel) for remainder queries or when NR0=1.
@@ -2207,7 +2426,7 @@ enum TurboQuantKernelOps {
         let blockSize = blockSize ?? flashBlockSize
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
-        let nr0 = flashNR0
+        let nr0 = flashNR0Override ?? 2
 
         // NR0 groups read one kv head (kv_indices[0]) for all rows; only valid
         // when the GQA repeat factor is a multiple of nr0 so aligned groups can

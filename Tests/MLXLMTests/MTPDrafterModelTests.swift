@@ -14,11 +14,14 @@ import Testing
 private final class MockMTPDrafter: Module, MTPDrafterModel {
     private(set) var draftCallCount = 0
 
+    func isCompatible(with target: any LanguageModel) -> Bool { true }
+
     func draftBlock(
         target: any LanguageModel,
         lastToken: MLXArray,
         lastHidden: MLXArray,
         sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
         queryOffset: Int,
         blockSize: Int,
         sampler: any LogitSampler
@@ -46,6 +49,7 @@ func testMTPDrafterModelProtocolShape() {
             "full_attention": (MLXArray.zeros([1, 1, 8, 4]), MLXArray.zeros([1, 1, 8, 4])),
             "sliding_attention": (MLXArray.zeros([1, 1, 8, 4]), MLXArray.zeros([1, 1, 8, 4])),
         ],
+        positionDeltas: nil,
         queryOffset: 0,
         blockSize: 4,
         sampler: ArgMaxSampler()
@@ -83,7 +87,9 @@ func testMTPDrafterContainerPerform() async {
 private final class DummyLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
     var kvHeads: [Int] { [] }
 
-    func prepare(_ input: LMInput, cache: [KVCache], state _: LMOutput.State?, windowSize: Int?)
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    )
         throws -> PrepareResult
     {
         .tokens(input.text)

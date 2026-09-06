@@ -11,9 +11,14 @@ import MLXNN
 
 // MARK: - Compute G
 
-func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay
+/// Fused form of the decay gate chain — elementwise, and MLX `compile`
+/// preserves per-node dtype rounding (verified bitwise against the unfused
+/// chain on the real decode/prefill shapes, bf16 and f16), so this is
+/// bit-identical while cutting ~6 kernel launches per GDN layer per step.
+private let computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { aLog, a, dtBias in
+    exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
 }
 
 // MARK: - Metal Kernel
@@ -56,10 +61,20 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             for (int t = 0; t < T; ++t) {
               if (\(maskSource)) {
                 float kv_mem = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] * g_[hv_idx];
-                  kv_mem += state[i] * k_[s_idx];
+                {
+                  // Preserve Kahan summation under Metal's default fast math.
+                  #pragma clang fp reassociate(off)
+                  #pragma clang fp contract(off)
+                  float kv_compensation = 0.0f;
+                  for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * g_[hv_idx];
+                    auto product = state[i] * k_[s_idx];
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = kv_mem + corrected;
+                    kv_compensation = (next_sum - kv_mem) - corrected;
+                    kv_mem = next_sum;
+                  }
                 }
                 kv_mem = simd_sum(kv_mem);
 
