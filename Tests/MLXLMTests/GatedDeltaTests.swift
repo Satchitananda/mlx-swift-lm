@@ -17,16 +17,19 @@ public class GatedDeltaTests: XCTestCase {
         B: Int = 1, T: Int = 16, Hk: Int = 2, Dk: Int = 32,
         Hv: Int = 4, Dv: Int = 16, seed: UInt64 = 42
     ) -> Inputs {
-        MLXRandom.seed(seed)
-        let dtype = DType.bfloat16
-        let q = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
-        let k = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
-        let v = MLXRandom.normal([B, T, Hv, Dv]).asType(dtype)
-        let a = MLXRandom.normal([B, T, Hv]).asType(dtype)
-        let b = MLXRandom.normal([B, T, Hv]).asType(dtype)
-        let aLog = (MLXRandom.normal([Hv]) * MLXArray(0.1)).asType(dtype)
-        let dtBias = MLXRandom.normal([Hv]).asType(dtype)
-        return Inputs(q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias)
+        // Task-local rather than MLXRandom.seed: parallel tests must not
+        // share (or perturb) the global random stream.
+        withRandomState(MLXRandom.RandomState(seed: seed)) {
+            let dtype = DType.bfloat16
+            let q = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
+            let k = MLXRandom.normal([B, T, Hk, Dk]).asType(dtype)
+            let v = MLXRandom.normal([B, T, Hv, Dv]).asType(dtype)
+            let a = MLXRandom.normal([B, T, Hv]).asType(dtype)
+            let b = MLXRandom.normal([B, T, Hv]).asType(dtype)
+            let aLog = (MLXRandom.normal([Hv]) * MLXArray(0.1)).asType(dtype)
+            let dtBias = MLXRandom.normal([Hv]).asType(dtype)
+            return Inputs(q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias)
+        }
     }
 
     /// Multi-chunk prefill must match single-chunk prefill at the same total T.
@@ -97,8 +100,8 @@ public class GatedDeltaTests: XCTestCase {
         )
 
         // Perturb only the trailing dims the truncating kernel would drop.
-        var qP = inputs.q
-        var kP = inputs.k
+        let qP = inputs.q
+        let kP = inputs.k
         qP[0..., 0..., 0..., 32...] = qP[0..., 0..., 0..., 32...] + MLXArray(1).asType(.bfloat16)
         kP[0..., 0..., 0..., 32...] = kP[0..., 0..., 0..., 32...] + MLXArray(1).asType(.bfloat16)
 
@@ -119,6 +122,40 @@ public class GatedDeltaTests: XCTestCase {
             "Perturbing trailing Dk dims (32..<48) left GDN output unchanged "
                 + "(\(maxDiff) max abs) — Dk % 32 != 0 was routed to the truncating "
                 + "kernel instead of the ops fallback."
+        )
+    }
+
+    /// The recurrent state update must retain low-order terms in its k-state dot product.
+    ///
+    /// Each SIMD lane accumulates one large value followed by five unit values. A naive
+    /// FP32 sum drops all five units, shifting the recurrent state by one ULP. Compensated
+    /// summation recovers them and matches the correctly rounded reference result.
+    func testGatedDeltaCompensatesRecurrentDotProduct() throws {
+        let keyDimension = 192
+        let laneState: [Float] = [100_000_000, 1, 1, 1, 1, 1]
+        let stateValues = (0 ..< 32).flatMap { _ in laneState }
+
+        let q = MLXArray.zeros([1, 1, 1, keyDimension], dtype: .bfloat16)
+        let k = MLXArray.ones([1, 1, 1, keyDimension], dtype: .bfloat16)
+        let v = MLXArray.zeros([1, 1, 1, 1], dtype: .bfloat16)
+        let a = MLXArray.zeros([1, 1, 1], dtype: .bfloat16)
+        let b = MLXArray.zeros([1, 1, 1], dtype: .bfloat16)
+        let aLog = MLXArray([-100] as [Float])
+        let dtBias = MLXArray.zeros([1], dtype: .bfloat16)
+        let state = MLXArray(stateValues).reshaped(1, 1, 1, keyDimension)
+
+        let (_, nextState) = gatedDeltaUpdate(
+            q: q, k: k, v: v, a: a, b: b,
+            aLog: aLog, dtBias: dtBias, state: state)
+
+        let actual = nextState[0, 0, 0, 0].item(Float.self)
+        let exactDotProduct = 32.0 * (100_000_000.0 + 5.0)
+        let expected = Float(100_000_000.0 - 0.5 * exactDotProduct)
+
+        XCTAssertEqual(
+            actual.bitPattern, expected.bitPattern,
+            "GDN recurrent dot product rounded to \(actual), expected \(expected). "
+                + "Naive FP32 accumulation loses the unit terms and returns -1.5e9."
         )
     }
 

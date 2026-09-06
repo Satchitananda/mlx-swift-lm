@@ -244,27 +244,21 @@ private func gemma4TextOnlyPromptTokens(_ input: LMInput) -> MLXArray {
 private func gemma4PrepareTextOnly(
     _ input: LMInput,
     cache: [any KVCache],
-    windowSize: Int?,
+    prefill: PrefillParameters,
     languageModel: Gemma4TextLanguageModel
-) -> PrepareResult {
-    let prefillStepSize = max(windowSize ?? 512, 1)
+) throws -> PrepareResult {
     let y = gemma4TextOnlyPromptTokens(input).expandedDimensions(axis: 0)
     let convertedCache = cache.map { $0 }
     let totalPositions = y.dim(1)
 
-    var processed = 0
-    while totalPositions - processed > 1 {
-        let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-        _ = languageModel(
-            y[0..., processed ..< (processed + chunkLength)],
-            cache: convertedCache
-        )
+    let processed = try prefill.forEachChunk(total: totalPositions) { range in
+        _ = languageModel(y[0..., range], cache: convertedCache)
         asyncEval(cache)
-        processed += chunkLength
     }
-
-    eval(cache)
-    return .logits(languageModel(y[0..., processed...], cache: convertedCache))
+    if processed > 0 { eval(cache) }
+    let result = languageModel(y[0..., processed...], cache: convertedCache)
+    prefill.progress?(totalPositions, totalPositions)
+    return .logits(result)
 }
 
 private func gemma4BlockSequenceIdsForMask(_ tokenTypeIds: MLXArray) -> MLXArray {
@@ -1217,7 +1211,10 @@ final class Gemma4TextBackbone: Module {
         perLayerInputs: MLXArray? = nil,
         tokenTypeIds: MLXArray? = nil,
         emitDrafterState: Bool = false
-    ) -> (hidden: MLXArray, sharedKV: [String: (MLXArray, MLXArray)]?) {
+    ) -> (
+        hidden: MLXArray, sharedKV: [String: (MLXArray, MLXArray)]?,
+        sharedKVSources: [String: Int]
+    ) {
         // Tolerate callers that hand us a 1D `(L,)` token array instead
         // of the canonical 2D `(B, L)` produced by `Gemma4Processor.prepare`.
         // The downstream `perLayerInputs` indexing path (`finalPerLayerInputs[
@@ -1254,7 +1251,6 @@ final class Gemma4TextBackbone: Module {
         }
         let finalPerLayerInputs = projectPerLayerInputs(h0, perLayerInputs: processedPerLayerInputs)
 
-        let hasExplicitCache = cache != nil
         let localCache =
             cache ?? Array(repeating: nil as KVCache?, count: max(firstKVSharedLayerIdx, 1))
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode
@@ -1352,7 +1348,7 @@ final class Gemma4TextBackbone: Module {
         let finalHidden = norm(h)
 
         guard emitDrafterState else {
-            return (finalHidden, nil)
+            return (finalHidden, nil, [:])
         }
 
         // Walk intermediates from the last layer backward; for each unique
@@ -1361,6 +1357,11 @@ final class Gemma4TextBackbone: Module {
         // signal to fall back to single-token generation (R8/R13 limitation,
         // documented).
         var sharedKV: [String: (MLXArray, MLXArray)] = [:]
+        // Which cache entry each emitted tuple came from. The consumer reconciles the emitted
+        // snapshot against the cache after a speculative commit, and it can only do that exactly
+        // if it knows the entry -- a sliding layer's snapshot is bounded by its ring, a global
+        // layer's is not, and the two are indistinguishable by length at the crossing.
+        var sharedKVSources: [String: Int] = [:]
         var seenTypes = Set<String>()
         let targetTypes: Set<String> = ["full_attention", "sliding_attention"]
         for idx in stride(from: layers.count - 1, through: 0, by: -1) {
@@ -1370,13 +1371,18 @@ final class Gemma4TextBackbone: Module {
             }
             if case .regular(let keys, let values) = intermediates[idx].kv {
                 sharedKV[layerType] = (keys, values)
+                // Recorded here rather than derived from `config.layerTypes`: the walk keeps
+                // descending past a quantized entry, so which layer supplies a type is a runtime
+                // fact.
+                sharedKVSources[layerType] = layerIdxToCacheIdx[idx]
                 seenTypes.insert(layerType)
             }
             if seenTypes == targetTypes { break }
         }
         // Treat partial coverage (e.g. only one layer_type populated, or
         // quantized cache for the other) as no-emit — iterator falls back.
-        return (finalHidden, seenTypes == targetTypes ? sharedKV : nil)
+        let complete = seenTypes == targetTypes
+        return (finalHidden, complete ? sharedKV : nil, complete ? sharedKVSources : [:])
     }
 }
 
@@ -1411,15 +1417,14 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         super.init()
     }
 
-    func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+    func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
         let slidingWindow = config.slidingWindow > 0 ? config.slidingWindow : 4096
-        return config.layerTypes.prefix(config.hiddenLayers - config.numKVSharedLayers).map {
+        return try config.layerTypes.prefix(config.hiddenLayers - config.numKVSharedLayers).map {
             layerType in
-            if layerType == "full_attention" {
-                StandardKVCache()
-            } else {
-                RotatingKVCache(maxSize: slidingWindow, keep: 0)
-            }
+            try makeHybridAttentionKVCache(
+                parameters: parameters,
+                slidingWindow: slidingWindow,
+                usesSlidingWindow: layerType != "full_attention")
         }
     }
 
@@ -1432,7 +1437,7 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         emitDrafterState: Bool = false
     ) -> LMOutput {
-        let (hidden, sharedKV) = model(
+        let (hidden, sharedKV, sharedKVSources) = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs,
             tokenTypeIds: tokenTypeIds,
@@ -1458,6 +1463,7 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         var state = LMOutput.State()
         state[mtpLastHiddenStatesKey] = hidden
         state[mtpSharedKVStatesKey] = sharedKV
+        state[mtpSharedKVSourceIndicesKey] = sharedKVSources
         return LMOutput(logits: softcappedLogits, state: state)
     }
 
@@ -2014,8 +2020,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         super.init()
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
 
     /// Runs the audio tower over mel features and projects to text hidden size,
@@ -2181,7 +2187,7 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -2204,10 +2210,13 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                     videoTokenId: config.videoTokenId,
                     audioTokenId: config.audioTokenId)
             )
+            let total = inputsEmbeds.dim(1)
+            prefill.progress?(total, total)
             return .logits(result)
         } else {
-            return gemma4PrepareTextOnly(
-                input, cache: convertedCache, windowSize: windowSize, languageModel: languageModel)
+            return try gemma4PrepareTextOnly(
+                input, cache: convertedCache, prefill: prefill,
+                languageModel: languageModel)
         }
     }
 
@@ -2533,8 +2542,8 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
         super.init()
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
 
     private func getImageFeatures(
@@ -2670,13 +2679,13 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
         if input.image == nil, input.video == nil, input.audio == nil {
-            return gemma4PrepareTextOnly(
-                input, cache: cache, windowSize: windowSize, languageModel: languageModel)
+            return try gemma4PrepareTextOnly(
+                input, cache: cache, prefill: prefill, languageModel: languageModel)
         }
 
         let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
@@ -2701,6 +2710,8 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
             perLayerInputs: perLayerInputs,
             tokenTypeIds: tokenTypeIds
         )
+        let total = inputsEmbeds.dim(1)
+        prefill.progress?(total, total)
         return .logits(result)
     }
 
@@ -2848,18 +2859,22 @@ public struct Gemma4Processor: UserInputProcessor {
         var frameCounts: [Int] = []
         for video in videos {
             let sequence = try await MediaProcessing.asProcessedSequence(
-                video, targetFPS: { _ in 1.0 }, maxFrames: config.videoMaxFrames
+                video,
+                processing: processing?.video ?? .init(),
+                targetFPS: { _ in 1.0 },
+                maxFrames: config.videoMaxFrames
             ) { frame in
                 var userProcessing = processing ?? UserInput.Processing()
                 userProcessing.resize = targetSize
-                var image = MediaProcessing.apply(frame.frame, processing: userProcessing)
+                var image = MediaProcessing.apply(
+                    try frame.image.asCIImage(), processing: userProcessing)
                 image = MediaProcessing.inSRGBToneCurveSpace(image)
                 image = MediaProcessing.resampleBicubic(image, to: targetSize)
                 if config.doNormalize {
                     image = MediaProcessing.normalize(
                         image, mean: config.imageMeanTuple, std: config.imageStdTuple)
                 }
-                return VideoFrame(frame: image, timeStamp: frame.timeStamp)
+                return VideoFrame(image: .ciImage(image), timeStamp: frame.timeStamp)
             }
             allFrames.append(contentsOf: sequence.frames)
             frameCounts.append(sequence.frames.count)
@@ -3564,4 +3579,14 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
         let mask = ones(like: promptArray).asType(.int8)
         return LMInput(text: .init(tokens: promptArray, mask: mask), image: processedImage)
     }
+}
+
+// MARK: - Chat conventions
+
+extension Gemma4 {
+    public var toolCallFormat: ToolCallFormat? { .gemma4 }
+}
+
+extension Gemma4Unified {
+    public var toolCallFormat: ToolCallFormat? { .gemma4 }
 }
