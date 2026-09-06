@@ -21,8 +21,10 @@ possible.
  
 ## Running Tests
 
-Unit tests run without any special hardware and do not download models.
-Note: `swift test` [does not work yet](https://github.com/ml-explore/mlx-swift?tab=readme-ov-file#xcodebuild) — use `xcodebuild` instead:
+Unit tests do not download models; tests evaluating MLX arrays need Metal.
+For this fork's verified SwiftPM setup, including the matching Metal library
+and serial full-precision numerical gate, see [Qwen runtime validation](QWEN38_INTEGRATION.md#validation).
+Xcode also assembles the test bundle:
 
 ```bash
 xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' -skipPackagePluginValidation
@@ -54,8 +56,9 @@ xcodebuild test \
 
 See [Libraries/IntegrationTestHelpers/README.md](Libraries/IntegrationTestHelpers/README.md) for more details.
 
-CI also verifies that DocC documentation builds without warnings for every
-library target. Run the same check locally with:
+The upstream CI verifies DocC documentation for library targets. Its workflow
+jobs are restricted to `ml-explore/mlx-swift-lm`, so they are skipped in this
+fork regardless of PR draft status. Run the documentation check locally with:
 
 ```bash
 scripts/verify-docs.sh
