@@ -61,7 +61,7 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // Keep the SightRoll sibling fork; it includes upstream MLX 0.31.6.
+        // Keep the SightRoll sibling fork and its quantization compatibility fixes.
         .package(path: "../mlx-swift"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full

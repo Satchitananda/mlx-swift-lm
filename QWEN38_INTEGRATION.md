@@ -1,7 +1,7 @@
 # Qwen3.8 runtime integration
 
-This branch integrates upstream runtime/test changes through
-`e3d4a20e9e20e7b8ab39aded7bbfad4ae22c9438`, followed by:
+This fork integrates merged upstream runtime/test changes through
+`604fae710a4e3324346fc59e3845952350acd4b7`, preserving:
 
 - [PR545](https://github.com/ml-explore/mlx-swift-lm/pull/545), head
   `1a562aa00bb66d611a086174e14951f41c43e100`: Qwen3.8 language/vision model
@@ -10,8 +10,18 @@ This branch integrates upstream runtime/test changes through
   `65c7f45eb5c9c58cafe1300f0ed356d742155221`: DFlash2 text speculative decoding.
 
 PR607 does not include PR545. The runtime prerequisite update also includes
-Qwen checkpoint norm sanitization and processor-loading fixes. Imported paths are
-`Libraries`, `Tests` and `Package.swift`; upstream CI/workflows are not imported.
+Qwen checkpoint norm sanitization and processor-loading fixes. The September 14
+sync includes upstream reference documentation alongside the runtime and unit
+tests. Fork CI/workflows, the separate integration project, and contributor policy
+are retained.
+
+The sync includes generation worker isolation (#611), Unicode streaming fixes
+(#613), Gemma VLM softcapping fusion (#615), differentiable gated-delta recurrence
+(#616), configuration-based LoRA metadata (#597), and wrapped rotating-cache
+trimming (#584). Pair it with the sibling MLX fork synced through
+`ea8a179690170ca891a97bc0473198ab1ecda5f4`, including wired-memory cancellation
+handling (#471) and the core update from upstream #450. No additional open PRs
+are included, and speculative decoding remains opt-in.
 
 The fork retains the local `../mlx-swift` dependency, Swift tools 6.2, Gemma4
 audio support and assistant registrations, generation-config propagation, and
@@ -22,12 +32,16 @@ the sibling fork's NVFP4 representation cannot safely discard that scale.
 
 ## Consumer compatibility
 
+The synced sibling MLX package requires Swift 6.3 or newer (including its
+experimental C generation support). Validation uses Xcode 26.6 / Swift 6.3.3.
+
+
 Use the accompanying mlx-swift-structured compatibility change. Its constrained
 iterator handles throwing cache creation, the current prefill policy and public
 iterator state; examples handle rejected tool calls. These API adaptations do
 not add DFlash2 support to the constrained iterator.
 
-The current DFlash2 target is `MLXLLM.Qwen35`. It rejects visual input and
+The current DFlash2 targets are `MLXLLM.Qwen35TextModel` and `MLXLLM.Qwen35Model`. It rejects visual input and
 unsupported caches; the production `MLXVLM` target is not supported. SightRoll's
 grammar processor also lacks an independent state-copy contract for speculative
 branches. DFlash2 remains disabled in the four-model SightRoll benchmark.
@@ -91,7 +105,27 @@ stalled on shared MLX evaluation/compiled-function locks, so the full gate ran
 serially. The SightRoll performance benchmark separately records and uses the
 production TF32 default.
 
-Structured's full suite passed 30 tests. CatalogKit's deterministic core passed
+In the earlier 2026-09-06 validation, Structured's full suite passed 30 tests.
+CatalogKit's deterministic core passed
 927 tests against this runtime before the final benchmark-runner review. Actual
 four-model output, failure, timing and memory evidence is retained in private
 SightRoll benchmark reports, outside these repositories.
+
+## Upstream sync validation — 2026-09-14
+
+The merged upstream runtime at `604fae710a4e3324346fc59e3845952350acd4b7`,
+paired with the sibling MLX integration at
+`76bb2f25e1708867b50feeec84bdea6f67a5e9fe`, passed a fresh host build and the
+serial full-precision suite: 638 XCTest executions (two skipped, zero failures)
+and 853 Swift Testing tests across 77 suites. The existing disabled
+`ConstraintCachingTests` suite remains unavailable for the reason documented
+above. No optional real-checkpoint benchmark is claimed by these totals.
+
+Six cache-validation fixtures now materialize loaded tensors before rewriting
+the file they came from. This avoids reading lazy arrays from a file while it
+is being replaced; typed cache validation assertions remain unchanged.
+
+The paired MLX core passed 584 MLX tests and one C bridge test. Structured
+passed all 35 tests across nine suites, and CatalogKit built against these
+updated dependencies. Model-quality and performance measurements run separately
+with production TF32 settings and frozen benchmark inputs.
