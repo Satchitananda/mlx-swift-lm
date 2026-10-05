@@ -873,7 +873,7 @@ struct TextToolCallRecoveryScanner: Sendable {
     }
 
     /// The end of a closing fence: a line starting with a run of `character`
-    /// at least as long as the opening run.
+    /// at least as long as the opening run, followed only by spaces or tabs.
     private func closingFenceEnd(
         in text: String, character: Character, minimumCount: Int
     ) -> String.Index? {
@@ -893,9 +893,18 @@ struct TextToolCallRecoveryScanner: Sendable {
                     }
                     let count = text.distance(from: index, to: runEnd)
                     if count >= minimumCount {
-                        // A run touching the buffer end may still grow; wait.
-                        guard runEnd < text.endIndex else { return nil }
-                        return runEnd
+                        var lineEnd = runEnd
+                        while lineEnd < text.endIndex,
+                            text[lineEnd] == " " || text[lineEnd] == "\t"
+                        {
+                            lineEnd = text.index(after: lineEnd)
+                        }
+                        // Wait for the complete line: a later non-whitespace
+                        // character keeps this candidate inside the code block.
+                        guard lineEnd < text.endIndex else { return nil }
+                        if text[lineEnd] == "\n" {
+                            return text.index(after: lineEnd)
+                        }
                     }
                 }
             }
@@ -908,7 +917,7 @@ struct TextToolCallRecoveryScanner: Sendable {
 
     /// Retention for a suffix that may become a closing fence line: optional
     /// indentation followed by a (possibly still growing) run of the fence
-    /// character at a line start.
+    /// character at a line start, followed by spaces or tabs.
     private func closingFenceRetention(in text: String, character: Character) -> Int {
         let lineStart: String.Index
         if let newline = text.range(of: "\n", options: .backwards) {
@@ -925,6 +934,9 @@ struct TextToolCallRecoveryScanner: Sendable {
         }
         guard spaces <= 3 else { return 0 }
         while index < text.endIndex, text[index] == character {
+            index = text.index(after: index)
+        }
+        while index < text.endIndex, text[index] == " " || text[index] == "\t" {
             index = text.index(after: index)
         }
         guard index == text.endIndex else { return 0 }

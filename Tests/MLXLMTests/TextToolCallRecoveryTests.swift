@@ -325,6 +325,97 @@ struct TextToolCallRecoveryTests {
         #expect(processor.toolCalls.isEmpty)
     }
 
+    // Value: protects=Markdown examples remain inert until a complete closing-fence line;
+    // fails_when=non-whitespace after a fence run ends code quarantine, including across chunks;
+    // why_new=existing code-fence coverage only uses a valid newline-terminated closer;
+    // seam=none
+    @Test(
+        "A Markdown closing fence needs a complete whitespace-only line",
+        arguments: ["```", "~~~"], [false, true])
+    func markdownFenceClosersMustEndTheLine(
+        fence: String, alternate: Bool
+    ) throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": ["city": ["type": "string"]],
+                        "required": ["city"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let example =
+            alternate
+            ? "<function=weather><parameter=city>Paris</parameter></function>"
+            : #"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#
+
+        func calls(in outputs: [ToolCallProcessor.Output]) -> [ToolCall] {
+            outputs.compactMap { output in
+                if case .toolCall(let call) = output { return call }
+                return nil
+            }
+        }
+
+        func check(
+            _ text: String, expectedResponse: String, expectedCallCount: Int,
+            reuseAfterEOS: Bool = false
+        ) throws {
+            let characters = Array(text)
+            var chunkings = [[text], characters.map(String.init)]
+            chunkings += (1 ..< characters.count).map { split in
+                [String(characters[..<split]), String(characters[split...])]
+            }
+            for chunks in chunkings {
+                let processor = ToolCallProcessor(
+                    format: .json, tools: tools,
+                    toolCallPolicy: .init(recovery: .conservative, validation: .strict))
+                var outputs: [ToolCallProcessor.Output] = []
+                for chunk in chunks {
+                    outputs += processor.processChunkOutputs(chunk)
+                }
+                outputs += processor.processEOSOutputs()
+
+                #expect(responseText(outputs) == expectedResponse)
+                let emittedCalls = calls(in: outputs)
+                #expect(emittedCalls.count == expectedCallCount)
+                #expect(emittedCalls.allSatisfy { $0.function.name == "weather" })
+                #expect(
+                    emittedCalls.allSatisfy { $0.function.arguments["city"] == .string("Paris") })
+                #expect(processor.rejectedToolCallCount == 0)
+                #expect(processor.recoveredToolCallCount == (alternate ? expectedCallCount : 0))
+
+                if reuseAfterEOS {
+                    let nextOutputs =
+                        processor.processChunkOutputs(example) + processor.processEOSOutputs()
+                    let nextCall = try #require(calls(in: nextOutputs).first)
+                    #expect(calls(in: nextOutputs).count == 1)
+                    #expect(nextCall.function.name == "weather")
+                    #expect(nextCall.function.arguments["city"] == .string("Paris"))
+                    #expect(responseText(nextOutputs).isEmpty)
+                }
+            }
+        }
+
+        let opening = fence + "json\n"
+        for trailingWhitespace in ["", " \t"] {
+            let invalid =
+                opening + fence + trailingWhitespace + "text\n" + example + "\n" + fence + "\n"
+            try check(invalid, expectedResponse: invalid, expectedCallCount: 0)
+
+            let validPrefix = opening + "example\n" + fence + trailingWhitespace + "\n"
+            try check(
+                validPrefix + example, expectedResponse: validPrefix, expectedCallCount: 1)
+
+            let closesAtEOS = opening + example + "\n" + fence + trailingWhitespace
+            try check(
+                closesAtEOS, expectedResponse: closesAtEOS, expectedCallCount: 0,
+                reuseAfterEOS: true)
+        }
+    }
+
     @Test("Native markers inside JSON arrays and strings are inert")
     func jsonDataCannotDispatchNativeCall() {
         let processor = ToolCallProcessor(format: .mistral, tools: Self.tools)
