@@ -25,6 +25,24 @@ import Testing
 
 struct Gemma4AudioTests {
 
+    @Test("Gemma message generation preserves image labels, video, and audio")
+    func labeledMixedMediaMessage() {
+        let message = Chat.Message.user(
+            "describe",
+            images: [.url(URL(fileURLWithPath: "/tmp/image.png"), label: "A")],
+            videos: [.url(URL(fileURLWithPath: "/tmp/video.mov"))],
+            audios: [.url(URL(fileURLWithPath: "/tmp/audio.wav"))])
+        let generated = Gemma4MessageGenerator().generate(message: message)
+        #expect(
+            generated["content"] as? [[String: String]] == [
+                ["type": "text", "text": "[A]"],
+                ["type": "image"],
+                ["type": "video"],
+                ["type": "audio"],
+                ["type": "text", "text": "describe"],
+            ])
+    }
+
     // MARK: Config
 
     /// A small-but-faithful audio config: real chunk/context/conv/scale values,
