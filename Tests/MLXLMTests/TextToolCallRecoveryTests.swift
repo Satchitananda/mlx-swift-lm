@@ -326,7 +326,7 @@ struct TextToolCallRecoveryTests {
     }
 
     // Value: protects=Markdown examples remain inert until a complete closing-fence line;
-    // fails_when=non-whitespace after a fence run ends code quarantine, including across chunks;
+    // fails_when=invalid fence lines or chunk-split indentation end code quarantine;
     // why_new=existing code-fence coverage only uses a valid newline-terminated closer;
     // seam=none
     @Test(
@@ -365,6 +365,10 @@ struct TextToolCallRecoveryTests {
         ) throws {
             let characters = Array(text)
             var chunkings = [[text], characters.map(String.init)]
+            chunkings.append(
+                stride(from: 0, to: characters.count, by: 2).map { start in
+                    String(characters[start ..< min(start + 2, characters.count)])
+                })
             chunkings += (1 ..< characters.count).map { split in
                 [String(characters[..<split]), String(characters[split...])]
             }
@@ -401,13 +405,22 @@ struct TextToolCallRecoveryTests {
 
         let opening = fence + "json\n"
         for trailingWhitespace in ["", " \t"] {
-            let invalid =
-                opening + fence + trailingWhitespace + "text\n" + example + "\n" + fence + "\n"
-            try check(invalid, expectedResponse: invalid, expectedCallCount: 0)
+            for invalidLine in [
+                fence + trailingWhitespace + "text",
+                "not a line start " + fence + trailingWhitespace,
+                "    " + fence + trailingWhitespace,
+            ] {
+                let invalid = opening + invalidLine + "\n" + example + "\n" + fence + "\n"
+                try check(invalid, expectedResponse: invalid, expectedCallCount: 0)
+            }
 
-            let validPrefix = opening + "example\n" + fence + trailingWhitespace + "\n"
-            try check(
-                validPrefix + example, expectedResponse: validPrefix, expectedCallCount: 1)
+            for indentation in 0 ... 3 {
+                let validPrefix =
+                    opening + "example\n" + String(repeating: " ", count: indentation)
+                    + fence + trailingWhitespace + "\n"
+                try check(
+                    validPrefix + example, expectedResponse: validPrefix, expectedCallCount: 1)
+            }
 
             let closesAtEOS = opening + example + "\n" + fence + trailingWhitespace
             try check(

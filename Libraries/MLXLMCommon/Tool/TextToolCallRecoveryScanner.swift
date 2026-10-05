@@ -854,7 +854,9 @@ struct TextToolCallRecoveryScanner: Sendable {
 
     /// Whether `index` begins a Markdown line: at most three spaces since the
     /// last newline (or since the start of the stream across chunks).
-    private func isLineStart(_ index: String.Index, in text: String) -> Bool {
+    private func isLineStart(
+        _ index: String.Index, in text: String, allowPrecedingSpaces: Bool = true
+    ) -> Bool {
         var spaces = 0
         var current = index
         while current > text.startIndex {
@@ -868,8 +870,10 @@ struct TextToolCallRecoveryScanner: Sendable {
         guard spaces <= 3 else { return false }
         guard let previous = previousSourceCharacter else { return true }
         // A preceding newline starts a line; preceding spaces may continue the
-        // indentation of one (over-gating into code is the safe direction).
-        return previous == "\n" || previous == " "
+        // indentation of one. That conservative opening-fence over-gating
+        // cannot establish a closing line: it could be inline text or a
+        // released indentation run longer than three spaces.
+        return previous == "\n" || (allowPrecedingSpaces && previous == " ")
     }
 
     /// The end of a closing fence: a line starting with a run of `character`
@@ -879,7 +883,7 @@ struct TextToolCallRecoveryScanner: Sendable {
     ) -> String.Index? {
         var lineStart = text.startIndex
         while lineStart < text.endIndex {
-            if isLineStart(lineStart, in: text) {
+            if isLineStart(lineStart, in: text, allowPrecedingSpaces: false) {
                 var index = lineStart
                 var spaces = 0
                 while index < text.endIndex, text[index] == " " {
@@ -923,7 +927,8 @@ struct TextToolCallRecoveryScanner: Sendable {
         if let newline = text.range(of: "\n", options: .backwards) {
             lineStart = newline.upperBound
         } else {
-            guard isLineStart(text.startIndex, in: text) else { return 0 }
+            guard isLineStart(text.startIndex, in: text, allowPrecedingSpaces: false)
+            else { return 0 }
             lineStart = text.startIndex
         }
         var index = lineStart
