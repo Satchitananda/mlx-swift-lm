@@ -852,6 +852,12 @@ struct TextToolCallRecoveryScanner: Sendable {
         return (text.distance(from: text.startIndex, to: index), index, index < text.endIndex)
     }
 
+    /// CommonMark recognizes LF, CR, and CRLF. Swift treats CRLF as one
+    /// Character; streamed chunks may also deliver its two scalars separately.
+    private func isMarkdownNewline(_ character: Character) -> Bool {
+        character == "\n" || character == "\r" || character == "\r\n"
+    }
+
     /// Whether `index` begins a Markdown line: at most three spaces since the
     /// last newline (or since the start of the stream across chunks).
     private func isLineStart(
@@ -862,7 +868,7 @@ struct TextToolCallRecoveryScanner: Sendable {
         while current > text.startIndex {
             let previous = text.index(before: current)
             let character = text[previous]
-            if character == "\n" { return spaces <= 3 }
+            if isMarkdownNewline(character) { return spaces <= 3 }
             guard character == " " else { return false }
             spaces += 1
             current = previous
@@ -873,7 +879,7 @@ struct TextToolCallRecoveryScanner: Sendable {
         // indentation of one. That conservative opening-fence over-gating
         // cannot establish a closing line: it could be inline text or a
         // released indentation run longer than three spaces.
-        return previous == "\n" || (allowPrecedingSpaces && previous == " ")
+        return isMarkdownNewline(previous) || (allowPrecedingSpaces && previous == " ")
     }
 
     /// The end of a closing fence: a line starting with a run of `character`
@@ -906,15 +912,15 @@ struct TextToolCallRecoveryScanner: Sendable {
                         // Wait for the complete line: a later non-whitespace
                         // character keeps this candidate inside the code block.
                         guard lineEnd < text.endIndex else { return nil }
-                        if text[lineEnd] == "\n" {
+                        if isMarkdownNewline(text[lineEnd]) {
                             return text.index(after: lineEnd)
                         }
                     }
                 }
             }
-            guard let newline = text.range(of: "\n", range: lineStart ..< text.endIndex)
+            guard let newline = text[lineStart...].firstIndex(where: isMarkdownNewline)
             else { return nil }
-            lineStart = newline.upperBound
+            lineStart = text.index(after: newline)
         }
         return nil
     }
@@ -924,8 +930,8 @@ struct TextToolCallRecoveryScanner: Sendable {
     /// character at a line start, followed by spaces or tabs.
     private func closingFenceRetention(in text: String, character: Character) -> Int {
         let lineStart: String.Index
-        if let newline = text.range(of: "\n", options: .backwards) {
-            lineStart = newline.upperBound
+        if let newline = text.lastIndex(where: isMarkdownNewline) {
+            lineStart = text.index(after: newline)
         } else {
             guard isLineStart(text.startIndex, in: text, allowPrecedingSpaces: false)
             else { return 0 }

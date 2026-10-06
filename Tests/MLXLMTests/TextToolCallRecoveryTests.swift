@@ -331,10 +331,15 @@ struct TextToolCallRecoveryTests {
     // seam=none
     @Test(
         "A Markdown closing fence needs a complete whitespace-only line",
-        arguments: ["```", "~~~"], [false, true])
+        arguments: [
+            ("```", "\n"), ("~~~", "\n"),
+            ("```", "\r\n"), ("~~~", "\r\n"),
+            ("```", "\r"), ("~~~", "\r"),
+        ], [false, true])
     func markdownFenceClosersMustEndTheLine(
-        fence: String, alternate: Bool
+        fenceAndNewline: (String, String), alternate: Bool
     ) throws {
+        let (fence, newline) = fenceAndNewline
         let tools: [[String: any Sendable]] = [
             [
                 "function": [
@@ -365,6 +370,11 @@ struct TextToolCallRecoveryTests {
         ) throws {
             let characters = Array(text)
             var chunkings = [[text], characters.map(String.init)]
+            let scalars = text.unicodeScalars.map { String($0) }
+            chunkings.append(scalars)
+            chunkings += (1 ..< scalars.count).map { split in
+                [scalars[..<split].joined(), scalars[split...].joined()]
+            }
             chunkings.append(
                 stride(from: 0, to: characters.count, by: 2).map { start in
                     String(characters[start ..< min(start + 2, characters.count)])
@@ -403,29 +413,34 @@ struct TextToolCallRecoveryTests {
             }
         }
 
-        let opening = fence + "json\n"
-        for trailingWhitespace in ["", " \t"] {
-            for invalidLine in [
-                fence + trailingWhitespace + "text",
-                "not a line start " + fence + trailingWhitespace,
-                "    " + fence + trailingWhitespace,
-            ] {
-                let invalid = opening + invalidLine + "\n" + example + "\n" + fence + "\n"
-                try check(invalid, expectedResponse: invalid, expectedCallCount: 0)
-            }
+        // A preceding line catches opening fences too: CRLF is a single Swift
+        // Character, while a stream can split it between Unicode scalars.
+        for prefix in ["", "Example:" + newline] {
+            let opening = prefix + fence + "json" + newline
+            for trailingWhitespace in ["", " \t"] {
+                for invalidLine in [
+                    fence + trailingWhitespace + "text",
+                    "not a line start " + fence + trailingWhitespace,
+                    "    " + fence + trailingWhitespace,
+                ] {
+                    let invalid =
+                        opening + invalidLine + newline + example + newline + fence + newline
+                    try check(invalid, expectedResponse: invalid, expectedCallCount: 0)
+                }
 
-            for indentation in 0 ... 3 {
-                let validPrefix =
-                    opening + "example\n" + String(repeating: " ", count: indentation)
-                    + fence + trailingWhitespace + "\n"
+                for indentation in 0 ... 3 {
+                    let validPrefix =
+                        opening + "example" + newline + String(repeating: " ", count: indentation)
+                        + fence + trailingWhitespace + newline
+                    try check(
+                        validPrefix + example, expectedResponse: validPrefix, expectedCallCount: 1)
+                }
+
+                let closesAtEOS = opening + example + newline + fence + trailingWhitespace
                 try check(
-                    validPrefix + example, expectedResponse: validPrefix, expectedCallCount: 1)
+                    closesAtEOS, expectedResponse: closesAtEOS, expectedCallCount: 0,
+                    reuseAfterEOS: true)
             }
-
-            let closesAtEOS = opening + example + "\n" + fence + trailingWhitespace
-            try check(
-                closesAtEOS, expectedResponse: closesAtEOS, expectedCallCount: 0,
-                reuseAfterEOS: true)
         }
     }
 
