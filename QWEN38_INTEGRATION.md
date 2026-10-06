@@ -1,5 +1,9 @@
 # Qwen3.8 runtime integration
 
+Current baseline: published mlx-swift-lm **3.32.3** with sibling mlx-swift
+**0.32.3**, updated on 2026-10-05. See [release sync notes](UPSTREAM_RELEASE_SYNC.md).
+The September sync and benchmark results below are historical evidence.
+
 This fork integrates merged upstream runtime/test changes through
 `604fae710a4e3324346fc59e3845952350acd4b7`, preserving:
 

@@ -2796,18 +2796,7 @@ public struct Gemma4MessageGenerator: MessageGenerator {
         } else {
             dictionary = [
                 "role": message.role.rawValue,
-                "content": message.images.map { _ in
-                    ["type": "image"]
-                }
-                    + message.videos.map { _ in
-                        ["type": "video"]
-                    }
-                    + message.audios.map { _ in
-                        ["type": "audio"]
-                    }
-                    + [
-                        ["type": "text", "text": message.content]
-                    ],
+                "content": contentParts(for: message, layout: .imagesThenVideosThenAudiosThenText),
             ]
         }
         addToolMetadata(to: &dictionary, for: message)
@@ -2883,7 +2872,8 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Gemma4MessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
@@ -3533,7 +3523,8 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Gemma4MessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,

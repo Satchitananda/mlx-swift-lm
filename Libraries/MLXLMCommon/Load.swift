@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+import CoreFoundation
 import Foundation
 import MLX
 import MLXNN
@@ -26,20 +27,25 @@ struct SafetensorSpan {
 /// The tensors of the safetensors file at `url`, ordered by their position in the file.
 ///
 /// Reads the 8-byte header length and the JSON header only. Throws when the file is not a
-/// well-formed safetensors file; callers fall back to loading the file whole.
+/// well-formed safetensors file. Invalid headers must not reach the native loader.
 func safetensorSpansInFileOrder(url: URL) throws -> [SafetensorSpan] {
     struct Malformed: Error {}
 
     let handle = try FileHandle(forReadingFrom: url)
     defer { try? handle.close() }
 
+    let fileLength = try handle.seekToEnd()
+    try handle.seek(toOffset: 0)
     guard let lengthData = try handle.read(upToCount: 8), lengthData.count == 8 else {
         throw Malformed()
     }
     let headerLength = lengthData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
         .littleEndian
     // a header bigger than this is not a header
-    guard headerLength > 0, headerLength <= 512 * 1024 * 1024 else { throw Malformed() }
+    guard headerLength > 0, headerLength <= 512 * 1024 * 1024,
+        fileLength >= 8, headerLength <= fileLength - 8,
+        let payloadLength = Int64(exactly: fileLength - 8 - headerLength)
+    else { throw Malformed() }
     guard let headerData = try handle.read(upToCount: Int(headerLength)),
         headerData.count == headerLength,
         let header = try JSONSerialization.jsonObject(with: headerData) as? [String: Any]
@@ -47,14 +53,24 @@ func safetensorSpansInFileOrder(url: URL) throws -> [SafetensorSpan] {
         throw Malformed()
     }
 
+    // JSONSerialization bridges booleans and fractional numbers to NSNumber too.
+    // Accept only exact nonnegative integers, without truncation or wrapping.
+    func offset(_ value: Any) -> Int64? {
+        guard let number = value as? NSNumber,
+            CFGetTypeID(number) != CFBooleanGetTypeID(),
+            let integer = Int64(number.stringValue), integer >= 0
+        else { return nil }
+        return integer
+    }
+
     var spans = [(name: String, begin: Int64, byteCount: Int64)]()
     for (name, value) in header {
         guard name != "__metadata__" else { continue }
         guard let entry = value as? [String: Any],
             let offsets = entry["data_offsets"] as? [Any], offsets.count == 2,
-            let begin = (offsets[0] as? NSNumber)?.int64Value,
-            let end = (offsets[1] as? NSNumber)?.int64Value,
-            end >= begin
+            let begin = offset(offsets[0]),
+            let end = offset(offsets[1]),
+            end >= begin, end <= payloadLength
         else {
             throw Malformed()
         }
@@ -64,11 +80,23 @@ func safetensorSpansInFileOrder(url: URL) throws -> [SafetensorSpan] {
     return spans.map { SafetensorSpan(name: $0.name, byteCount: $0.byteCount) }
 }
 
+private enum WeightByteCountError: Error { case invalidOrOverflowingCount }
+
+private func checkedByteTotal(_ counts: [Int64]) throws -> Int64 {
+    var total: Int64 = 0
+    for count in counts {
+        let (sum, overflow) = total.addingReportingOverflow(count)
+        guard count >= 0, !overflow else { throw WeightByteCountError.invalidOrOverflowingCount }
+        total = sum
+    }
+    return total
+}
+
 /// Contiguous index ranges of `byteCounts` whose byte totals are balanced around
 /// `total / groupCount`, preserving order.
-func contiguousLoadGroups(byteCounts: [Int64], groupCount: Int) -> [Range<Int>] {
+func contiguousLoadGroups(byteCounts: [Int64], groupCount: Int) throws -> [Range<Int>] {
     guard !byteCounts.isEmpty else { return [] }
-    let total = byteCounts.reduce(0, +)
+    let total = try checkedByteTotal(byteCounts)
     guard groupCount > 1, total > 0 else { return [0 ..< byteCounts.count] }
 
     let groups = Int64(groupCount)
@@ -78,7 +106,11 @@ func contiguousLoadGroups(byteCounts: [Int64], groupCount: Int) -> [Range<Int>] 
     var boundary: Int64 = 1
     for (index, byteCount) in byteCounts.enumerated() {
         cumulative += byteCount
-        if boundary < groups, cumulative >= total * boundary / groups {
+        // Full-width multiplication preserves floor(total * boundary / groups).
+        // boundary < groups guarantees the quotient is <= total and fits Int64.
+        if boundary < groups,
+            cumulative >= groups.dividingFullWidth(total.multipliedFullWidth(by: boundary)).quotient
+        {
             ranges.append(start ..< index + 1)
             start = index + 1
             boundary += 1
@@ -149,8 +181,7 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 ///
 /// Each work item lazily opens its file, evaluates only its assigned tensors (forcing that
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
-/// header cannot be parsed is loaded whole by one work item, which is exactly the serial
-/// loader's behavior for that file.
+/// header cannot be parsed is rejected before the native loader runs.
 func loadWeightArrays(urls: [URL]) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
@@ -161,23 +192,26 @@ func loadWeightArrays(urls: [URL]) throws -> (
         let names: [String]?
     }
 
-    let items: [WorkItem] = {
-        var spansPerFile = [[SafetensorSpan]?]()
+    let items: [WorkItem] = try {
+        var spansPerFile = [[SafetensorSpan]]()
         var totalBytes: Int64 = 0
         for url in urls {
-            let spans = try? safetensorSpansInFileOrder(url: url)
+            let spans = try safetensorSpansInFileOrder(url: url)
             spansPerFile.append(spans)
-            totalBytes += spans?.reduce(0) { $0 + $1.byteCount } ?? 0
+            totalBytes = try checkedByteTotal([
+                totalBytes, checkedByteTotal(spans.map(\.byteCount)),
+            ])
         }
 
         let concurrency = weightLoadConcurrency()
         let groupBytes = max(minimumBytesPerLoadGroup, totalBytes / Int64(concurrency))
         var items = [WorkItem]()
         for (file, url) in urls.enumerated() {
-            if let spans = spansPerFile[file], !spans.isEmpty {
-                let bytes = spans.reduce(0) { $0 + $1.byteCount }
+            let spans = spansPerFile[file]
+            if !spans.isEmpty {
+                let bytes = try checkedByteTotal(spans.map(\.byteCount))
                 let groupCount = max(1, Int(bytes / groupBytes))
-                for range in contiguousLoadGroups(
+                for range in try contiguousLoadGroups(
                     byteCounts: spans.map(\.byteCount), groupCount: groupCount)
                 {
                     items.append(
@@ -385,52 +419,23 @@ public func loadWeights(
     weights = model.sanitize(weights: weights, metadata: metadata)
 
     // quantize if needed
-    var builtMXFP8Layer = false
     if quantization != nil || perLayerQuantization != nil {
-        quantize(
-            model: model,
-            filter: { path, module in
-                if weights["\(path).scales"] != nil {
-                    if let perLayerQuantization {
-                        return perLayerQuantization.quantization(layer: path)?.asTuple
-                    } else {
-                        return quantization?.asTuple
-                    }
+        quantize(model: model) { path, module in
+            if weights["\(path).scales"] != nil {
+                if let perLayerQuantization {
+                    return perLayerQuantization.quantization(layer: path)?.asTuple
                 } else {
-                    return nil
+                    return quantization?.asTuple
                 }
-            },
-            apply: { layer, groupSize, bits, mode in
-                // mxfp8 matmul kernel requires biases == nil (zero-points don't exist
-                // in this format). QuantizedLinear's default init always produces non-nil
-                // biases via affine quantization, which crashes at inference.
-                // Use the explicit initializer with biases:nil; weight/scales are
-                // overwritten by model.update(parameters:) with the real checkpoint data.
-                if mode == .mxfp8, let linear = layer as? Linear {
-                    builtMXFP8Layer = true
-                    let w = linear.weight
-                    let dummyScales = MLXArray.zeros([w.dim(0), max(1, w.dim(1) / groupSize)])
-                    return QuantizedLinear(
-                        weight: w, bias: linear.bias,
-                        scales: dummyScales, biases: nil,
-                        groupSize: groupSize, bits: bits, mode: mode)
-                }
-                return quantizeSingle(layer: layer, groupSize: groupSize, bits: bits, mode: mode)
+            } else {
+                return nil
             }
-        )
+        }
     }
 
     // apply the loaded weights
-    //
-    // Strict verification (.all) by default — a checkpoint whose packed shapes don't
-    // match the quantized modules must fail loudly, not decode as garbage (upstream
-    // regression #395). Relax to .noUnusedKeys ONLY when an mxfp8 layer was built:
-    // pre-quantized mxfp8 models carry a different weight layout than the affine
-    // QuantizedLinear placeholder above, and their shapes are reconciled via
-    // _updateInternal once the real data is applied.
     let parameters = ModuleParameters.unflattened(weights)
-    try model.update(
-        parameters: parameters, verify: builtMXFP8Layer ? [.noUnusedKeys] : [.all])
+    try model.update(parameters: parameters, verify: [.all])
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.

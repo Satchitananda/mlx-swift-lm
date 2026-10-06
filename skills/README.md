@@ -1,6 +1,6 @@
 # MLX Swift LM skill
 
-This repo ships an MLX Swift LM skill definition under `skills/mlx-swift-lm/` (the `skill.md`
+This repo ships an MLX Swift LM skill definition under `skills/mlx-swift-lm/` (the [SKILL.md](mlx-swift-lm/SKILL.md)
 file plus `references/`). The install folder name can be `mlx-swift-lm`, as shown below.
 If your local copy lives at `skills/mlx-swift-lm`, just swap the source path in the
 commands.

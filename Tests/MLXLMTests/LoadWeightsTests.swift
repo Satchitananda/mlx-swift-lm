@@ -70,28 +70,66 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
     }
 }
 
+private final class MXFP8CheckpointModel: Module, BaseLanguageModel {
+    @ModuleInfo(key: "layer") var layer: Linear
+
+    override init() {
+        _layer.wrappedValue = Linear(64, 32, bias: false)
+    }
+}
+
 final class LoadWeightsTests: XCTestCase {
+
+    func testMXFP8CheckpointLoadsWithStrictVerification() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let configuration = try JSONDecoder().decode(
+            BaseConfiguration.Quantization.self,
+            from: Data(#"{"group_size":32,"bits":8,"mode":"mxfp8"}"#.utf8))
+        let source = QuantizedLinear(
+            Linear(64, 32, bias: false), groupSize: 32, bits: 8, mode: .mxfp8)
+        try save(
+            arrays: ["layer.weight": source.weight, "layer.scales": source.scales],
+            url: directory.appendingPathComponent("model.safetensors"))
+        let model = MXFP8CheckpointModel()
+        try loadWeights(
+            modelDirectory: directory, model: model,
+            quantization: configuration)
+        let loaded = try XCTUnwrap(model.layer as? QuantizedLinear)
+        XCTAssertEqual(loaded.mode, .mxfp8)
+        XCTAssertNil(loaded.biases)
+        let input = MLXArray.ones([1, 64])
+        XCTAssertTrue(allClose(loaded(input), source(input), rtol: 0, atol: 0).item(Bool.self))
+        try save(
+            arrays: ["layer.weight": source.weight, "layer.scales": MLXArray.zeros([1, 1])],
+            url: directory.appendingPathComponent("model.safetensors"))
+        XCTAssertThrowsError(
+            try loadWeights(
+                modelDirectory: directory, model: MXFP8CheckpointModel(),
+                quantization: configuration))
+    }
 
     // MARK: - Concurrent loading
 
-    func testContiguousLoadGroupsBalanceBytesAndPreserveOrder() {
+    func testContiguousLoadGroupsBalanceBytesAndPreserveOrder() throws {
         // one huge tensor between small ones: boundaries land after the bytes, never inside
-        let groups = contiguousLoadGroups(byteCounts: [1, 1, 100, 1, 1], groupCount: 2)
+        let groups = try contiguousLoadGroups(byteCounts: [1, 1, 100, 1, 1], groupCount: 2)
         XCTAssertEqual(groups, [0 ..< 3, 3 ..< 5])
 
-        let even = contiguousLoadGroups(byteCounts: [10, 10, 10, 10], groupCount: 2)
+        let even = try contiguousLoadGroups(byteCounts: [10, 10, 10, 10], groupCount: 2)
         XCTAssertEqual(even, [0 ..< 2, 2 ..< 4])
 
         // every index appears exactly once, in order
-        let many = contiguousLoadGroups(byteCounts: Array(repeating: 7, count: 100), groupCount: 16)
+        let many = try contiguousLoadGroups(
+            byteCounts: Array(repeating: 7, count: 100), groupCount: 16)
         XCTAssertEqual(many.flatMap { Array($0) }, Array(0 ..< 100))
     }
 
-    func testContiguousLoadGroupsDegenerateInputs() {
-        XCTAssertEqual(contiguousLoadGroups(byteCounts: [], groupCount: 4), [])
-        XCTAssertEqual(contiguousLoadGroups(byteCounts: [5], groupCount: 4), [0 ..< 1])
-        XCTAssertEqual(contiguousLoadGroups(byteCounts: [0, 0], groupCount: 4), [0 ..< 2])
-        XCTAssertEqual(contiguousLoadGroups(byteCounts: [1, 2, 3], groupCount: 1), [0 ..< 3])
+    func testContiguousLoadGroupsDegenerateInputs() throws {
+        XCTAssertEqual(try contiguousLoadGroups(byteCounts: [], groupCount: 4), [])
+        XCTAssertEqual(try contiguousLoadGroups(byteCounts: [5], groupCount: 4), [0 ..< 1])
+        XCTAssertEqual(try contiguousLoadGroups(byteCounts: [0, 0], groupCount: 4), [0 ..< 2])
+        XCTAssertEqual(try contiguousLoadGroups(byteCounts: [1, 2, 3], groupCount: 1), [0 ..< 3])
     }
 
     func testSafetensorSpansComeBackInFileOrder() throws {
@@ -122,6 +160,48 @@ final class LoadWeightsTests: XCTestCase {
         let url = directory.appendingPathComponent("weights.safetensors")
         try Data("not a safetensors file at all".utf8).write(to: url)
 
+        XCTAssertThrowsError(try safetensorSpansInFileOrder(url: url))
+    }
+
+    func testSafetensorSpansRejectsInvalidOffsets() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("model.safetensors")
+        for offsets in [
+            "[-1, 0]", "[0.5, 1]", "[false, 1]", "[0, 5]", "[2, 1]",
+            "[-9223372036854775808, 9223372036854775807]",
+            "[0, 18446744073709551615]",
+        ] {
+            try writeRawWeightHeader(
+                offsets: offsets, payload: Data(repeating: 0, count: 4), to: url)
+            XCTAssertThrowsError(try safetensorSpansInFileOrder(url: url), offsets)
+        }
+    }
+
+    func testLoadGroupsRejectOverflowAndBalanceLargeValidTotals() throws {
+        XCTAssertThrowsError(try contiguousLoadGroups(byteCounts: [.max, 1], groupCount: 4))
+        XCTAssertThrowsError(try contiguousLoadGroups(byteCounts: [-1, 2], groupCount: 2))
+        let quarter = Int64.max / 4
+        let groups = try contiguousLoadGroups(
+            byteCounts: Array(repeating: quarter, count: 4), groupCount: 4)
+        XCTAssertEqual(groups, [0 ..< 1, 1 ..< 2, 2 ..< 3, 3 ..< 4])
+    }
+
+    func testPublicWeightLoaderRejectsOverflowingHeader() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeRawWeightHeader(
+            offsets: "[-9223372036854775808, 9223372036854775807]",
+            to: directory.appendingPathComponent("model.safetensors"))
+        XCTAssertThrowsError(try loadWeights(modelDirectory: directory, model: TwoLayerModel()))
+    }
+
+    func testTruncatedHeaderIsRejected() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("model.safetensors")
+        var length = UInt64(1024).littleEndian
+        try withUnsafeBytes(of: &length) { try Data($0).write(to: url) }
         XCTAssertThrowsError(try safetensorSpansInFileOrder(url: url))
     }
 
@@ -475,6 +555,16 @@ final class LoadWeightsTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data().write(to: url)
+    }
+
+    private func writeRawWeightHeader(offsets: String, payload: Data = Data(), to url: URL) throws {
+        let header = Data(
+            "{\"layer.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":\(offsets)}}".utf8)
+        var length = UInt64(header.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(header)
+        file.append(payload)
+        try file.write(to: url)
     }
 
     private func writeIndex(_ weightMap: [String: String], in directory: URL) throws {
