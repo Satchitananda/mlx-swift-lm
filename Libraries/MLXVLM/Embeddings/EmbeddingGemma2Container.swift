@@ -93,37 +93,61 @@ public final class EmbeddingGemma2Container: Sendable {
         try Task.checkCancellation()
         return try await context.read { context in
             try Task.checkCancellation()
-            let rows = try inputs.map { try context.processor.prepare($0) }
-            var outputs: [Output] = []
-            var start = 0
-            while start < rows.count {
-                try Task.checkCancellation()
-                var end = start + 1
-                var length = rows[start].tokens.dim(1)
-                while end < rows.count, end - start < maximumBatchSize {
-                    if rows[end].tokens.dim(1) != length { break }
-                    let nextLength = max(length, rows[end].tokens.dim(1))
-                    if nextLength * (end - start + 1) > maximumPaddedTokens { break }
-                    length = nextLength
-                    end += 1
-                }
-                let prepared = try EmbeddingGemma2Processor.batch(
-                    Array(rows[start ..< end]),
-                    padToken: context.model.configuration.text.padToken)
-                let vectors = try context.model(prepared, visionBatchSize: visionBatchSize)
-                eval(vectors)
-                try Task.checkCancellation()
-                for row in start ..< end {
-                    let values = vectors[row - start].asArray(Float.self)
-                    let norm = values.reduce(0.0) { $0 + Double($1) * Double($1) }
-                    guard values.count == context.model.configuration.text.embeddingDimensions,
-                        values.allSatisfy(\.isFinite), norm.isFinite, abs(norm - 1) <= 0.002
-                    else { throw EmbeddingGemma2Error.invalidOutput }
-                    outputs.append(Output(vector: values, expandedTokens: rows[row].tokens.dim(1)))
-                }
-                start = end
-            }
-            return outputs
+            return try mapEmbeddingGemma2Batches(
+                inputs, maximumBatchSize: maximumBatchSize,
+                prepare: { try context.processor.prepare($0) },
+                consume: { rows in
+                    var outputs: [Output] = []
+                    var start = 0
+                    while start < rows.count {
+                        try Task.checkCancellation()
+                        var end = start + 1
+                        var length = rows[start].tokens.dim(1)
+                        while end < rows.count, end - start < maximumBatchSize {
+                            if rows[end].tokens.dim(1) != length { break }
+                            let nextLength = max(length, rows[end].tokens.dim(1))
+                            if nextLength * (end - start + 1) > maximumPaddedTokens { break }
+                            length = nextLength
+                            end += 1
+                        }
+                        let prepared = try EmbeddingGemma2Processor.batch(
+                            Array(rows[start ..< end]),
+                            padToken: context.model.configuration.text.padToken)
+                        let vectors = try context.model(prepared, visionBatchSize: visionBatchSize)
+                        eval(vectors)
+                        try Task.checkCancellation()
+                        for row in start ..< end {
+                            let values = vectors[row - start].asArray(Float.self)
+                            let norm = values.reduce(0.0) { $0 + Double($1) * Double($1) }
+                            guard
+                                values.count
+                                    == context.model.configuration.text.embeddingDimensions,
+                                values.allSatisfy(\.isFinite), norm.isFinite, abs(norm - 1) <= 0.002
+                            else { throw EmbeddingGemma2Error.invalidOutput }
+                            outputs.append(
+                                Output(vector: values, expandedTokens: rows[row].tokens.dim(1)))
+                        }
+                        start = end
+                    }
+                    return outputs
+                })
         }
     }
+}
+
+/// Preprocessed MLX media is scoped to one bounded chunk. Caller-owned primitive
+/// inputs may span the whole request, but prepared rows never do.
+func mapEmbeddingGemma2Batches<Input, Prepared, Output>(
+    _ inputs: [Input], maximumBatchSize: Int,
+    prepare: (Input) throws -> Prepared,
+    consume: ([Prepared]) throws -> [Output]
+) throws -> [Output] {
+    guard (1 ... 4).contains(maximumBatchSize) else { throw EmbeddingGemma2Error.invalidInput }
+    var outputs: [Output] = []
+    for start in stride(from: 0, to: inputs.count, by: maximumBatchSize) {
+        try Task.checkCancellation()
+        let rows = try inputs[start ..< min(start + maximumBatchSize, inputs.count)].map(prepare)
+        outputs += try consume(rows)
+    }
+    return outputs
 }

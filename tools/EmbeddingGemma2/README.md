@@ -14,7 +14,9 @@ FP32 vector and the fully expanded token count. Arrays/modules stay inside one
 exclusive `SerialAccessContainer`.
 
 `embedBatch(_:)` accepts 1...4 independent ordered parts arrays and returns one
-output per input. Expanded-token and batch-token limits split inference without
+output per input. Preprocessed media is retained only for the current bounded
+chunk; caller-owned primitive inputs remain the caller’s memory responsibility.
+Expanded-token and batch-token limits split inference without
 truncating requests; different token lengths use separate batches to preserve
 individual attention shapes. Padded collation excludes padding from attention
 keys and pooling and keeps padding queries finite beyond the sliding window.

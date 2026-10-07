@@ -81,6 +81,40 @@ import Testing
         #expect(!masks.local[0, 0, 3, 4].item(Bool.self))
     }
 
+    @Test(arguments: [1, 2, 4]) func preprocessedRowsAreReleasedBetweenBoundedChunks(
+        _ batchSize: Int
+    ) throws {
+        final class Tracker {
+            var active = 0
+            var peak = 0
+        }
+        final class Row {
+            let value: Int
+            let tracker: Tracker
+            init(_ value: Int, tracker: Tracker) {
+                self.value = value
+                self.tracker = tracker
+                tracker.active += 1
+                tracker.peak = max(tracker.peak, tracker.active)
+            }
+            deinit { tracker.active -= 1 }
+        }
+        let tracker = Tracker()
+        var consumed: [Int] = []
+        let outputs = try mapEmbeddingGemma2Batches(
+            [0, 1, 2, 3], maximumBatchSize: batchSize,
+            prepare: { Row($0, tracker: tracker) },
+            consume: { rows in
+                #expect(tracker.active <= batchSize)
+                consumed += rows.map(\.value)
+                return rows.map(\.value)
+            })
+        #expect(outputs == [0, 1, 2, 3])
+        #expect(consumed == outputs)
+        #expect(tracker.peak == batchSize)
+        #expect(tracker.active == 0)
+    }
+
     @Test func longPaddingKeepsAttentionAndPoolingFinite() throws {
         let model = try EmbeddingGemma2Model(configuration(), towers: [])
         try model.update(
