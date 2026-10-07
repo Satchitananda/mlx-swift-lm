@@ -347,7 +347,8 @@ private final class Gemma4AudioAttention: Module {
         var sinEmb = concatenated([sin(scaledTime), cos(scaledTime)], axis: -1)  // [maxSpan, 2·nt]
         // The reference rounds timing signals to the projection's activation
         // dtype before its matmul, then returns to the FP32 attention dtype.
-        let projectionDType = (relativeKProj as? QuantizedLinear)?.scales.dtype ?? relativeKProj.weight.dtype
+        let projectionDType =
+            (relativeKProj as? QuantizedLinear)?.scales.dtype ?? relativeKProj.weight.dtype
         sinEmb = relativeKProj(sinEmb.asType(projectionDType)).asType(queries.dtype)  // [maxSpan, N·H]
         sinEmb = sinEmb.reshaped(maxSpan, numHeads, headDim)
 
@@ -567,7 +568,8 @@ final class Gemma4AudioModel: Module {
         let distance = query + maxPast - context
         // The pinned encoder uses strict context bounds. A pair of inclusive
         // triangular masks admitted one extra past key in every query window.
-        return ((distance .>= 0) .&& (distance .< maxPast))
+        return (distance .== 0)
+            .|| ((distance .> 0) .&& (distance .< maxPast))
             .|| ((distance .< 0) .&& ((-distance) .< maxFuture))
     }
 

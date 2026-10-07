@@ -45,11 +45,7 @@ public final class EmbeddingGemma2Container: Sendable {
                         }
                         let c = try JSONDecoder().decode(
                             EmbeddingGemma2Configuration.self, from: data)
-                        let required = [
-                            c.text.bosToken, c.text.eosToken, c.imageToken, c.videoToken,
-                            c.audioToken,
-                            c.beginImageToken, c.endImageToken, c.beginAudioToken, c.endAudioToken,
-                        ]
+                        let required = c.controlTokenIDs
                         guard
                             required.allSatisfy({ id in
                                 guard let token = tokenizer.convertIdToToken(id) else {

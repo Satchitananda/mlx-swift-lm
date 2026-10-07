@@ -131,11 +131,67 @@ import Testing
             try processor.prepare(Array(repeating: .image(image), count: 128))
         }
         #expect(throws: EmbeddingGemma2Error.self) {
-            try processor.prepare([.text("<begin_of_image>")])
+            try processor.prepare([.text("s24")])
         }
         #expect(throws: EmbeddingGemma2Error.self) {
             try processor.prepare([.audio([.nan])])
         }
+    }
+
+    @Test func registeredControlTokensAreRejectedAcrossAdjacentTextParts() throws {
+        let c = try configuration()
+        let processor = EmbeddingGemma2Processor(configuration: c, tokenizer: ProcessorTokenizer())
+        for id in c.controlTokenIDs {
+            #expect(throws: EmbeddingGemma2Error.self) {
+                try processor.prepare([.text("hello s\(id) world")])
+            }
+        }
+        #expect(throws: EmbeddingGemma2Error.self) {
+            try processor.prepare([.text("hello s"), .text("1 world")])
+        }
+    }
+
+    @Test(arguments: ["pad_token_id", "bos_token_id", "eos_token_id"])
+    func vocabularyBoundsRejectSpecialTokenGather(_ key: String) throws {
+        var json = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: fixture("config.json")))
+                as? [String: Any])
+        var text = try #require(json["text_config"] as? [String: Any])
+        text[key] = 40
+        json["text_config"] = text
+        #expect(throws: EmbeddingGemma2Error.self) {
+            try JSONDecoder().decode(
+                EmbeddingGemma2Configuration.self,
+                from: JSONSerialization.data(withJSONObject: json))
+        }
+    }
+
+    @Test(arguments: [0, 1, 128]) func subFrameAudioNeverGathersOutsidePadding(_ count: Int) throws
+    {
+        let result = Gemma4AudioFeatureExtractor()(
+            MLXArray(Array(repeating: Float(0), count: count)))
+        #expect(result.features.shape == [1, 0, 128])
+        #expect(result.mask.shape == [1, 0])
+        let processor = EmbeddingGemma2Processor(
+            configuration: try configuration(), tokenizer: ProcessorTokenizer())
+        #expect(throws: EmbeddingGemma2Error.self) {
+            try processor.prepare([.audio(Array(repeating: 0, count: count))])
+        }
+    }
+
+    @Test(arguments: [0, 1]) func zeroPastAudioContextStillAttendsTheCurrentFrame(_ left: Int)
+        throws
+    {
+        let c = try JSONDecoder().decode(
+            Gemma4AudioConfiguration.self,
+            from: Data(
+                """
+                {"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2,
+                 "attention_chunk_size":3,"attention_context_left":\(left),"attention_context_right":0}
+                """.utf8))
+        let mask = Gemma4AudioModel(config: c).buildCausalValidMask()
+        #expect(
+            mask.asArray(Bool.self) == [true, false, false, false, true, false, false, false, true])
     }
 
     @Test func nativeAudioFeaturesMatchPinnedProcessor() throws {

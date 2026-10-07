@@ -178,16 +178,24 @@ enum EmbeddingGemma2ImageProcessing {
 struct EmbeddingGemma2Processor {
     let configuration: EmbeddingGemma2Configuration
     let tokenizer: any Tokenizer
+    private let reservedTokens: Set<String>
     private let audioExtractor = Gemma4AudioFeatureExtractor()
 
     init(configuration: EmbeddingGemma2Configuration, tokenizer: any Tokenizer) {
         self.configuration = configuration
         self.tokenizer = tokenizer
+        reservedTokens = Set(configuration.controlTokenIDs.compactMap(tokenizer.convertIdToToken))
     }
 
     func prepare(_ parts: [EmbeddingGemma2Part]) throws -> EmbeddingGemma2Prepared {
         guard !parts.isEmpty, parts.count <= 128 else { throw EmbeddingGemma2Error.invalidInput }
+        guard reservedTokens.count == configuration.controlTokenIDs.count,
+            reservedTokens.allSatisfy({ !$0.isEmpty })
+        else {
+            throw EmbeddingGemma2Error.invalidConfiguration
+        }
         var rendered = ""
+        var textSegment = ""
         var mediaTokens = 2  // BOS/EOS are part of the expanded budget.
         var textBytes = 0
         func reserveMedia(_ count: Int) throws {
@@ -204,15 +212,14 @@ struct EmbeddingGemma2Processor {
             case .text(let text):
                 textBytes += text.utf8.count
                 guard !text.isEmpty, text.utf8.count <= 1_000_000,
-                    textBytes <= 1_000_000,
-                    ![
-                        "<|image|>", "<|video|>", "<|audio|>", "<begin_of_image>",
-                        "<begin_of_audio>",
-                    ]
-                    .contains(where: text.contains)
+                    textBytes <= 1_000_000
+                else { throw EmbeddingGemma2Error.invalidInput }
+                textSegment += text
+                guard !reservedTokens.contains(where: textSegment.contains)
                 else { throw EmbeddingGemma2Error.invalidInput }
                 rendered += text
             case .image(let image):
+                textSegment = ""
                 let size = EmbeddingGemma2ImageProcessing.targetSize(
                     width: image.width, height: image.height, maxTokens: 280)
                 try reserveMedia((size.width / 48) * (size.height / 48))
@@ -222,6 +229,7 @@ struct EmbeddingGemma2Processor {
                     begin: configuration.beginImageToken, media: configuration.imageToken,
                     end: configuration.endImageToken, count: prepared.tokens)
             case .video(let video):
+                textSegment = ""
                 guard !video.isEmpty, video.count <= 32,
                     zip(video, video.dropFirst()).allSatisfy({
                         $0.timestampMillis < $1.timestampMillis
@@ -239,6 +247,7 @@ struct EmbeddingGemma2Processor {
                         end: configuration.endImageToken, count: prepared.tokens)
                 }
             case .audio(let samples):
+                textSegment = ""
                 guard !samples.isEmpty, samples.count <= 480_000, samples.allSatisfy(\.isFinite)
                 else { throw EmbeddingGemma2Error.invalidInput }
                 let prepared = audioExtractor(MLXArray(samples))

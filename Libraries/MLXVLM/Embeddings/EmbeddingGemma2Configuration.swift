@@ -97,6 +97,7 @@ public struct EmbeddingGemma2Configuration: Decodable, Sendable {
             guard vocabularySize > 0, hiddenSize > 0, intermediateSize > 0, layers > 0,
                 attentionHeads > 0, keyValueHeads > 0, headDim > 0, headDim.isMultiple(of: 2),
                 perLayerWidth >= 0, embeddingDimensions > 0, eps > 0, slidingWindow >= 0,
+                [padToken, bosToken, eosToken].allSatisfy({ (0 ..< vocabularySize).contains($0) }),
                 layerTypes.count == layers,
                 layerTypes.allSatisfy({ ["sliding_attention", "full_attention"].contains($0) }),
                 layerTypes.allSatisfy({ rope[$0]?.type == "default" && (rope[$0]?.theta ?? 0) > 0 })
@@ -124,6 +125,13 @@ public struct EmbeddingGemma2Configuration: Decodable, Sendable {
     let endImageToken: Int
     let beginAudioToken: Int
     let endAudioToken: Int
+
+    var controlTokenIDs: [Int] {
+        [
+            text.bosToken, text.eosToken, imageToken, videoToken, audioToken,
+            beginImageToken, endImageToken, beginAudioToken, endAudioToken,
+        ]
+    }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -155,6 +163,9 @@ public struct EmbeddingGemma2Configuration: Decodable, Sendable {
         endImageToken = try c.decodeIfPresent(Int.self, forKey: .endImageToken) ?? 258_882
         beginAudioToken = try c.decodeIfPresent(Int.self, forKey: .beginAudioToken) ?? 256_000
         endAudioToken = try c.decodeIfPresent(Int.self, forKey: .endAudioToken) ?? 258_883
+        guard controlTokenIDs.allSatisfy({ (0 ..< text.vocabularySize).contains($0) }) else {
+            throw EmbeddingGemma2Error.invalidConfiguration
+        }
     }
 }
 
