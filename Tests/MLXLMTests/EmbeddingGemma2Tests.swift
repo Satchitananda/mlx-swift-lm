@@ -81,6 +81,78 @@ import Testing
         #expect(!masks.local[0, 0, 3, 4].item(Bool.self))
     }
 
+    @Test func longPaddingKeepsAttentionAndPoolingFinite() throws {
+        let model = try EmbeddingGemma2Model(configuration(), towers: [])
+        try model.update(
+            parameters: .unflattened(loadArrays(url: fixture("tiny-float32.safetensors"))),
+            verify: [.all])
+        let rows: [EmbeddingGemma2Prepared] = [
+            .init(
+                tokens: MLXArray([2, 8, 7, 1], [1, 4]), valid: MLXArray.ones([1, 4]).asType(.bool),
+                images: [], videoFrames: [], audio: []),
+            .init(
+                tokens: MLXArray(Array(repeating: 6, count: 40), [1, 40]),
+                valid: MLXArray.ones([1, 40]).asType(.bool),
+                images: [], videoFrames: [], audio: []),
+        ]
+        let batch = try EmbeddingGemma2Processor.batch(rows, padToken: 0)
+        let masks = EmbeddingGemma2Text.masks(batch.valid, window: 2)
+        #expect(all(sum(masks.local.asType(.int32), axis: -1) .> 0).item(Bool.self))
+        let together = try model(batch)
+        let individual = try model(rows[0])
+        #expect(allClose(together[0], individual[0], atol: 1e-6).all().item(Bool.self))
+        let hidden = MLXArray([Float(1), 1, .nan, .nan], [1, 2, 2])
+        let pooled = EmbeddingGemma2Model.pool(hidden, valid: MLXArray([1, 0], [1, 2]))
+        #expect(pooled.asArray(Float.self).allSatisfy { $0.isFinite })
+    }
+
+    @Test(arguments: [DType.float32, .bfloat16]) func processorBatchPreservesIndependentRows(
+        _ dtype: DType
+    ) throws {
+        let model = try EmbeddingGemma2Model(configuration(), towers: [])
+        let weights = try loadArrays(url: fixture("tiny-float32.safetensors")).mapValues {
+            $0.asType(dtype)
+        }
+        try model.update(parameters: .unflattened(weights), verify: [.all])
+        let rows: [EmbeddingGemma2Prepared] = [
+            .init(
+                tokens: MLXArray([2, 8, 7, 1], [1, 4]), valid: MLXArray.ones([1, 4]).asType(.bool),
+                images: [], videoFrames: [], audio: []),
+            .init(
+                tokens: MLXArray([2, 6, 1], [1, 3]), valid: MLXArray.ones([1, 3]).asType(.bool),
+                images: [], videoFrames: [], audio: []),
+        ]
+        let batch = try EmbeddingGemma2Processor.batch(rows, padToken: 0)
+        #expect(batch.tokens.shape == [2, 4])
+        #expect(
+            batch.valid.asArray(Bool.self) == [true, true, true, true, true, true, true, false])
+        let together = try model(batch)
+        eval(together)
+        for index in rows.indices {
+            let separate = try model(rows[index])
+            #expect(
+                allClose(together[index], separate[0], atol: dtype == .float32 ? 1e-6 : 2e-3).all()
+                    .item(Bool.self))
+        }
+        #expect(throws: EmbeddingGemma2Error.self) {
+            try EmbeddingGemma2Processor.batch([], padToken: 0)
+        }
+    }
+
+    @Test func processorBatchKeepsMediaOrderAcrossSamples() throws {
+        let rows = (1 ... 2).map { index in
+            EmbeddingGemma2Prepared(
+                tokens: MLXArray([2, 28, 1], [1, 3]),
+                valid: MLXArray.ones([1, 3]).asType(.bool), images: [MLXArray(index)],
+                videoFrames: [MLXArray(index + 10)], audio: [(MLXArray(index + 20), MLXArray(true))]
+            )
+        }
+        let batch = try EmbeddingGemma2Processor.batch(rows, padToken: 0)
+        #expect(batch.images.map { $0.item(Int.self) } == [1, 2])
+        #expect(batch.videoFrames.map { $0.item(Int.self) } == [11, 12])
+        #expect(batch.audio.map { $0.features.item(Int.self) } == [21, 22])
+    }
+
     @Test func scatterPreservesOrderedMediaSlotsAndRejectsMismatch() throws {
         let base = MLXArray.zeros([2, 3, 2])
         let tokens = MLXArray([1, 28, 28, 28, 2, 0], [2, 3])

@@ -277,6 +277,48 @@ struct EmbeddingGemma2Processor {
             images: images, videoFrames: frames, audio: audio)
     }
 
+    /// Right padding preserves each sample's positions and excludes padding
+    /// from both attention keys and pooling. Media remains in row-major order.
+    static func batch(_ rows: [EmbeddingGemma2Prepared], padToken: Int) throws
+        -> EmbeddingGemma2Prepared
+    {
+        guard !rows.isEmpty, rows.count <= 4,
+            rows.allSatisfy({
+                $0.tokens.ndim == 2 && $0.tokens.dim(0) == 1
+                    && $0.tokens.shape == $0.valid.shape && $0.tokens.dim(1) > 0
+            })
+        else { throw EmbeddingGemma2Error.invalidInput }
+        if rows.count == 1 { return rows[0] }
+        let length = rows.map { $0.tokens.dim(1) }.max()!
+        guard length <= 8192 else {
+            throw EmbeddingGemma2Error.tokenBudgetExceeded(actual: length, limit: 8192)
+        }
+        let tokens = rows.map { row in
+            let padding = length - row.tokens.dim(1)
+            return padding == 0
+                ? row.tokens
+                : concatenated(
+                    [
+                        row.tokens,
+                        MLXArray.full([1, padding], values: MLXArray(padToken)).asType(
+                            row.tokens.dtype),
+                    ], axis: 1)
+        }
+        let masks = rows.map { row in
+            let padding = length - row.valid.dim(1)
+            return padding == 0
+                ? row.valid
+                : concatenated(
+                    [
+                        row.valid, MLXArray.zeros([1, padding]).asType(.bool),
+                    ], axis: 1)
+        }
+        return EmbeddingGemma2Prepared(
+            tokens: concatenated(tokens, axis: 0),
+            valid: concatenated(masks, axis: 0), images: rows.flatMap(\.images),
+            videoFrames: rows.flatMap(\.videoFrames), audio: rows.flatMap(\.audio))
+    }
+
     private func block(begin: Int, media: Int, end: Int, count: Int) -> String {
         tokenizer.convertIdToToken(begin)!
             + String(repeating: tokenizer.convertIdToToken(media)!, count: count)

@@ -13,6 +13,16 @@ and the durable vector-space signature. Output contains an evaluated normalized
 FP32 vector and the fully expanded token count. Arrays/modules stay inside one
 exclusive `SerialAccessContainer`.
 
+`embedBatch(_:)` accepts 1...4 independent ordered parts arrays and returns one
+output per input. Expanded-token and batch-token limits split inference without
+truncating requests; different token lengths use separate batches to preserve
+individual attention shapes. Padded collation excludes padding from attention
+keys and pooling and keeps padding queries finite beyond the sliding window.
+Equal-shaped vision inputs can share batches of 1...8 frames (default 2 for
+the batch API); the audio tower still encodes individual inputs. `embed(_:)`
+retains its single-frame vision schedule. This API does not merge videos into
+one joint vector or expose MLX tensors across the container boundary.
+
 Loading verifies every required tensor and tokenizer special token. BF16 and
 FP32 are supported; affine quantization and FP16 are rejected. Requests are
 bounded to 8192 expanded tokens, 32 frames per video part, 30 seconds per audio

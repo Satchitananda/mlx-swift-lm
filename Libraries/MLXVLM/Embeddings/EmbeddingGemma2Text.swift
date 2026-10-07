@@ -163,7 +163,10 @@ final class EmbeddingGemma2Text: Module {
         let positions = MLXArray.arange(length)
         return (
             full,
-            full .&& (abs(positions.reshaped(length, 1) - positions.reshaped(1, length)) .<= window)
+            (full
+                .&& (abs(positions.reshaped(length, 1) - positions.reshaped(1, length)) .<= window))
+                .|| ((.!valid.asType(.bool)).reshaped(valid.dim(0), 1, length, 1)
+                    .&& (positions.reshaped(length, 1) .== positions.reshaped(1, length)))
         )
     }
 

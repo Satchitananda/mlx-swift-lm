@@ -96,12 +96,17 @@ final class EmbeddingGemma2Model: Module, BaseLanguageModel {
         let mask = valid.asType(.float32)[.ellipsis, .newAxis]
         // The pinned pooling helper promotes the mask and sum to FP32 even
         // when token projections use BF16. Padding never contributes.
-        let pooled = sum(hidden * mask, axis: 1) / maximum(sum(mask, axis: 1), 1e-9)
+        let selected = which(
+            valid.asType(.bool)[.ellipsis, .newAxis], hidden, MLXArray(0, dtype: hidden.dtype))
+        let pooled = sum(selected * mask, axis: 1) / maximum(sum(mask, axis: 1), 1e-9)
         let fp32 = pooled.asType(.float32)
         return fp32 / maximum(sqrt(sum(fp32 * fp32, axis: -1, keepDims: true)), 1e-12)
     }
 
-    func callAsFunction(_ input: EmbeddingGemma2Prepared) throws -> MLXArray {
+    func callAsFunction(_ input: EmbeddingGemma2Prepared, visionBatchSize: Int = 1) throws
+        -> MLXArray
+    {
+        guard (1 ... 8).contains(visionBatchSize) else { throw EmbeddingGemma2Error.invalidInput }
         guard input.tokens.ndim == 2, input.tokens.shape == input.valid.shape,
             input.tokens.dim(0) > 0, input.tokens.dim(1) > 0,
             input.tokens.dim(1) <= 8192,
@@ -125,7 +130,19 @@ final class EmbeddingGemma2Model: Module, BaseLanguageModel {
                 guard let vision, let visionProjection else {
                     throw EmbeddingGemma2Error.missingTower
                 }
-                for image in pixels { features.append(visionProjection(vision(image))[0]) }
+                // Only equal shapes share a tower batch. Restore original media
+                // order before scatter; aspect ratios never force resampling.
+                var start = 0
+                while start < pixels.count {
+                    var end = start + 1
+                    while end < pixels.count, end - start < visionBatchSize,
+                        pixels[end].shape == pixels[start].shape
+                    { end += 1 }
+                    let encoded = visionProjection(
+                        vision(concatenated(Array(pixels[start ..< end]), axis: 0)))
+                    for row in 0 ..< (end - start) { features.append(encoded[row]) }
+                    start = end
+                }
             }
             embeddings = try Self.scatter(
                 embeddings, tokens: input.tokens, mediaToken: token,
