@@ -1895,14 +1895,15 @@ private final class Gemma4VisionTransformerModel: Module {
     }
 }
 
-private final class Gemma4VisionModel: Module {
+// Shared by the generative model and the dedicated bidirectional embedding encoder.
+final class Gemma4VisionModel: Module {
     let config: Gemma4VisionConfiguration
     let patchSize: Int
     let poolingKernelSize: Int
 
-    @ModuleInfo(key: "patch_embedder") var patchEmbedder: Gemma4VisionPatchEmbedder
-    @ModuleInfo(key: "encoder") var encoder: Gemma4VisionTransformerModel
-    @ModuleInfo(key: "pooler") var pooler: Gemma4VisionPooler
+    @ModuleInfo(key: "patch_embedder") private var patchEmbedder: Gemma4VisionPatchEmbedder
+    @ModuleInfo(key: "encoder") private var encoder: Gemma4VisionTransformerModel
+    @ModuleInfo(key: "pooler") private var pooler: Gemma4VisionPooler
     @ModuleInfo(key: "std_bias") var standardizationBias: MLXArray?
     @ModuleInfo(key: "std_scale") var standardizationScale: MLXArray?
 
@@ -1965,7 +1966,7 @@ private final class Gemma4VisionModel: Module {
     }
 }
 
-private final class Gemma4MultimodalEmbedder: Module, UnaryLayer {
+final class Gemma4MultimodalEmbedder: Module, UnaryLayer {
     @ModuleInfo(key: "embedding_projection") var embeddingProjection: Linear
     @ModuleInfo(key: "embedding_pre_projection_norm") var embeddingPreProjectionNorm:
         Gemma4RMSNormNoScale
