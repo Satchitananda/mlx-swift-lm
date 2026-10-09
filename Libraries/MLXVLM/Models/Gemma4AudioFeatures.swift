@@ -87,6 +87,9 @@ public struct Gemma4AudioFeatureExtractor {
         // Reference unfolds with size `frameLength + 1` (a preemphasis affordance),
         // then, with preemphasis disabled, keeps the first `frameLength` samples.
         let frameSizeForUnfold = frameLength + 1
+        guard paddedLen >= frameSizeForUnfold else {
+            return (MLXArray.zeros([1, 0, featureSize]), MLXArray.zeros([1, 0]).asType(.bool))
+        }
         let numFrames = (paddedLen - frameSizeForUnfold) / hopLength + 1
         guard numFrames > 0 else {
             return (

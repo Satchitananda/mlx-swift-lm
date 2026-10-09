@@ -345,7 +345,11 @@ private final class Gemma4AudioAttention: Module {
         let pos = expandedDimensions(MLXArray(positions), axis: -1)  // [maxSpan, 1]
         let scaledTime = pos * expandedDimensions(invTimescales, axis: 0)  // [maxSpan, numTimescales]
         var sinEmb = concatenated([sin(scaledTime), cos(scaledTime)], axis: -1)  // [maxSpan, 2·nt]
-        sinEmb = relativeKProj(sinEmb.asType(queries.dtype))  // [maxSpan, N·H]
+        // The reference rounds timing signals to the projection's activation
+        // dtype before its matmul, then returns to the FP32 attention dtype.
+        let projectionDType =
+            (relativeKProj as? QuantizedLinear)?.scales.dtype ?? relativeKProj.weight.dtype
+        sinEmb = relativeKProj(sinEmb.asType(projectionDType)).asType(queries.dtype)  // [maxSpan, N·H]
         sinEmb = sinEmb.reshaped(maxSpan, numHeads, headDim)
 
         // Content term: [B, N, U, W, H] @ [B, N, U, H, C] -> [B, N, U, W, C].
@@ -382,8 +386,8 @@ private final class Gemma4AudioAttention: Module {
         var k = kProj(hiddenStates).asType(.float32).reshaped(b, t, numHeads, headDim)
         let v = vProj(hiddenStates).asType(.float32).reshaped(b, t, numHeads, headDim)
 
-        let perDim = softplus(perDimScale).asType(.float32)  // [H]
-        q = q * (perDim * MLXArray(qScale))
+        let perDim = softplus(perDimScale)  // [H], round scaling in the parameter dtype first
+        q = q * (perDim * MLXArray(qScale, dtype: perDim.dtype))
         k = k * MLXArray(kScale)
 
         let queryBlocks = convertToBlock(q)  // [B, U, W, N, H]
@@ -554,16 +558,19 @@ final class Gemma4AudioModel: Module {
     }
 
     /// Local causal+validity mask `[chunk_size, context_size]` for chunked attention.
-    private func buildCausalValidMask() -> MLXArray {
+    func buildCausalValidMask() -> MLXArray {
         let w = config.attentionChunkSize
         let maxFuture = config.attentionContextRight
         let maxPast = max(0, config.attentionContextLeft - 1)
-        let upperDiagonal = maxPast + maxFuture
         let c = w + maxPast + maxFuture
-
-        let lowerCausal = tril(MLXArray.ones([c, w])).transposed(1, 0)  // [W, C]
-        let upperCausal = tril(MLXArray.ones([w, c]), k: upperDiagonal)  // [W, C]
-        return (lowerCausal * upperCausal).asType(.bool)
+        let query = MLXArray.arange(w).reshaped(w, 1)
+        let context = MLXArray.arange(c).reshaped(1, c)
+        let distance = query + maxPast - context
+        // The pinned encoder uses strict context bounds. A pair of inclusive
+        // triangular masks admitted one extra past key in every query window.
+        return (distance .== 0)
+            .|| ((distance .> 0) .&& (distance .< maxPast))
+            .|| ((distance .< 0) .&& ((-distance) .< maxFuture))
     }
 
     /// - Parameters:
