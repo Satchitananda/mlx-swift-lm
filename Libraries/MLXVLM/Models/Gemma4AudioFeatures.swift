@@ -109,7 +109,14 @@ public struct Gemma4AudioFeatureExtractor {
         frames = frames * window
 
         // rfft -> magnitude (not power) -> mel -> log.
-        let stft = rfft(frames, n: fftLength, axis: -1)  // [numFrames, fftLength/2+1] complex
+        // Zero-pad each frame to `fftLength` here instead of asking `rfft` for `n`: the core's
+        // own padding path records its `slice_update` on the calling thread's default stream, so
+        // a graph built on one thread could not be evaluated on another ("There is no Stream(gpu, N)
+        // in current thread"). Explicit padding keeps the whole graph on the caller's stream.
+        if fftLength > frameLength {
+            frames = padded(frames, widths: [IntOrPair((0, 0)), IntOrPair((0, fftLength - frameLength))])
+        }
+        let stft = rfft(frames, axis: -1)  // [numFrames, fftLength/2+1] complex
         let re = stft.realPart()
         let im = stft.imaginaryPart()
         let magnitude = sqrt(re * re + im * im)
