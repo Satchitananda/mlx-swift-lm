@@ -1,7 +1,7 @@
 import Foundation
 
 /// The encoder checkpoint configuration. This is distinct from Gemma 4's causal decoder.
-public struct EmbeddingGemma2Configuration: Decodable, Sendable {
+public struct EmbeddingGemma2ContainerConfiguration: Decodable, Sendable {
     public struct Text: Decodable, Sendable {
         public struct Layer: Decodable, Sendable {
             let headDim: Int?

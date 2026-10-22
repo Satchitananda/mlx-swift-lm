@@ -31,7 +31,7 @@ private final class EmbeddingGemma2Attention: Module {
     private let dimension: Int
     private let rotary: EmbeddingGemma2Rotary
 
-    init(_ c: EmbeddingGemma2Configuration.Text, layer: Int) {
+    init(_ c: EmbeddingGemma2ContainerConfiguration.Text, layer: Int) {
         let override = c.layerOverrides[String(format: "%02d", layer)]
         heads = override?.attentionHeads ?? c.attentionHeads
         kvHeads = override?.keyValueHeads ?? c.keyValueHeads
@@ -68,7 +68,7 @@ private final class EmbeddingGemma2MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
-    init(_ c: EmbeddingGemma2Configuration.Text) {
+    init(_ c: EmbeddingGemma2ContainerConfiguration.Text) {
         _gate.wrappedValue = Linear(c.hiddenSize, c.intermediateSize, bias: false)
         _up.wrappedValue = Linear(c.hiddenSize, c.intermediateSize, bias: false)
         _down.wrappedValue = Linear(c.intermediateSize, c.hiddenSize, bias: false)
@@ -82,7 +82,7 @@ private final class EmbeddingGemma2PerLayerInputs: Module, UnaryLayer {
     @ModuleInfo(key: "per_layer_projection_norm") var norm: RMSNorm
     private let layers: Int, width: Int
     private let scale: Float
-    init(_ c: EmbeddingGemma2Configuration.Text) {
+    init(_ c: EmbeddingGemma2ContainerConfiguration.Text) {
         layers = c.layers
         width = c.perLayerWidth
         scale = pow(Float(c.hiddenSize), -0.5)
@@ -99,7 +99,7 @@ private final class EmbeddingGemma2PerLayerBlock: Module {
     @ModuleInfo(key: "per_layer_input_gate") var gate: Linear
     @ModuleInfo(key: "per_layer_projection") var projection: Linear
     @ModuleInfo(key: "post_per_layer_input_norm") var norm: RMSNorm
-    init(_ c: EmbeddingGemma2Configuration.Text) {
+    init(_ c: EmbeddingGemma2ContainerConfiguration.Text) {
         _gate.wrappedValue = Linear(c.hiddenSize, c.perLayerWidth, bias: false)
         _projection.wrappedValue = Linear(c.perLayerWidth, c.hiddenSize, bias: false)
         _norm.wrappedValue = RMSNorm(dimensions: c.hiddenSize, eps: c.eps)
@@ -119,7 +119,7 @@ private final class EmbeddingGemma2Layer: Module {
     @ModuleInfo(key: "post_feedforward_layernorm") var outputNorm: RMSNorm
     @ModuleInfo(key: "ple_block") var perLayer: EmbeddingGemma2PerLayerBlock?
     @ParameterInfo(key: "layer_scalar") var scalar: MLXArray
-    init(_ c: EmbeddingGemma2Configuration.Text, layer: Int) {
+    init(_ c: EmbeddingGemma2ContainerConfiguration.Text, layer: Int) {
         _attention.wrappedValue = EmbeddingGemma2Attention(c, layer: layer)
         _mlp.wrappedValue = EmbeddingGemma2MLP(c)
         _inputNorm.wrappedValue = RMSNorm(dimensions: c.hiddenSize, eps: c.eps)
@@ -146,8 +146,8 @@ final class EmbeddingGemma2Text: Module {
     @ModuleInfo(key: "layers") private var layers: [EmbeddingGemma2Layer]
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "embedding_projection") var projection: Linear
-    let configuration: EmbeddingGemma2Configuration.Text
-    init(_ c: EmbeddingGemma2Configuration.Text) {
+    let configuration: EmbeddingGemma2ContainerConfiguration.Text
+    init(_ c: EmbeddingGemma2ContainerConfiguration.Text) {
         configuration = c
         _tokens.wrappedValue = Embedding(embeddingCount: c.vocabularySize, dimensions: c.hiddenSize)
         _perLayer.wrappedValue = c.perLayerWidth > 0 ? EmbeddingGemma2PerLayerInputs(c) : nil

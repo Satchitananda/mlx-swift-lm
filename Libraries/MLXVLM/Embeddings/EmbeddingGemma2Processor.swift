@@ -176,12 +176,12 @@ enum EmbeddingGemma2ImageProcessing {
 }
 
 struct EmbeddingGemma2Processor {
-    let configuration: EmbeddingGemma2Configuration
+    let configuration: EmbeddingGemma2ContainerConfiguration
     let tokenizer: any Tokenizer
     private let reservedTokens: Set<String>
     private let audioExtractor = Gemma4AudioFeatureExtractor()
 
-    init(configuration: EmbeddingGemma2Configuration, tokenizer: any Tokenizer) {
+    init(configuration: EmbeddingGemma2ContainerConfiguration, tokenizer: any Tokenizer) {
         self.configuration = configuration
         self.tokenizer = tokenizer
         reservedTokens = Set(configuration.controlTokenIDs.compactMap(tokenizer.convertIdToToken))

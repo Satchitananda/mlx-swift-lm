@@ -56,7 +56,7 @@ import Testing
         try #require(!samples.isEmpty && samples.count <= 500)
         try #require(Set(samples.map(\.id)).count == samples.count)
         let data = try Data(contentsOf: directory.appending(path: "config.json"))
-        let c = try JSONDecoder().decode(EmbeddingGemma2Configuration.self, from: data)
+        let c = try JSONDecoder().decode(EmbeddingGemma2ContainerConfiguration.self, from: data)
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
         let loadStart = ContinuousClock.now
         let model = try EmbeddingGemma2Model(c, towers: [.vision, .audio])

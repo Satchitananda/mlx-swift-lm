@@ -19,10 +19,10 @@ final class EmbeddingGemma2Model: Module, BaseLanguageModel {
     @ModuleInfo(key: "embed_vision") var visionProjection: Gemma4MultimodalEmbedder?
     @ModuleInfo(key: "audio_tower") var audio: Gemma4AudioModel?
     @ModuleInfo(key: "embed_audio") var audioProjection: Gemma4MultimodalEmbedder?
-    let configuration: EmbeddingGemma2Configuration
+    let configuration: EmbeddingGemma2ContainerConfiguration
     let towers: Set<EmbeddingGemma2Tower>
 
-    init(_ c: EmbeddingGemma2Configuration, towers: Set<EmbeddingGemma2Tower>) throws {
+    init(_ c: EmbeddingGemma2ContainerConfiguration, towers: Set<EmbeddingGemma2Tower>) throws {
         configuration = c
         self.towers = towers
         _text.wrappedValue = EmbeddingGemma2Text(c.text)

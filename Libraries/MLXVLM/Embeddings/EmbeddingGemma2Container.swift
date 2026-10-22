@@ -44,7 +44,7 @@ public final class EmbeddingGemma2Container: Sendable {
                             throw EmbeddingGemma2Error.unsupportedPrecision
                         }
                         let c = try JSONDecoder().decode(
-                            EmbeddingGemma2Configuration.self, from: data)
+                            EmbeddingGemma2ContainerConfiguration.self, from: data)
                         let required = c.controlTokenIDs
                         guard
                             required.allSatisfy({ id in
