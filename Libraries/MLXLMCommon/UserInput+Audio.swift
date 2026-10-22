@@ -31,12 +31,15 @@ extension UserInput.Audio {
                 throw UserInputError.noAudioData(url)
             }
 
+            // Pin the byte order: without it the reader keeps the source's, and a
+            // big-endian file (AIFF) comes back as byte-swapped float32 garbage.
             let settings: [String: Any] = [
                 AVFormatIDKey: processing.audioFormat.asAudioFormatID,
                 AVSampleRateKey: processing.sampleRate,
                 AVNumberOfChannelsKey: processing.channels,
                 AVLinearPCMBitDepthKey: 32,
                 AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsBigEndianKey: false,
                 AVLinearPCMIsNonInterleaved: false,
             ]
 
