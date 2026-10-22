@@ -10,6 +10,11 @@ import Testing
 
 @Suite(.serialized)
 struct Gemma3nSharedKVTests {
+    /// Absolute bounds for logits and for one attention layer computed two ways. TF32 matmuls
+    /// leave ~8e-3 and ~8e-4 respectively where IEEE float32 leaves ~1e-6; see MatmulPrecision.
+    private static let logitsAtol = MatmulPrecision.tolerance(float32: 2e-5, reduced: 3e-2)
+    private static let attentionAtol = MatmulPrecision.tolerance(float32: 2e-5, reduced: 5e-3)
+
     @Test(arguments: [[12], [2, 3, 1, 6], Array(repeating: 1, count: 12)])
     func chunkingAndRotationMatchUncachedAttention(chunks: [Int]) throws {
         try withRandomState(MLXRandom.RandomState(seed: 42)) {
@@ -23,7 +28,9 @@ struct Gemma3nSharedKVTests {
             for reserve in [0, 3] {
                 let cache = try caches(model, reserve: reserve)
                 let output = forward(model, tokens: tokens, chunks: chunks, cache: cache)
-                #expect(allClose(output, expected, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+                #expect(
+                    allClose(output, expected, rtol: 2e-4, atol: Self.logitsAtol)
+                        .item(Bool.self))
                 #expect(cache.count == 4)
                 #expect(cache.allSatisfy { $0.offset == 12 })
             }
@@ -47,7 +54,7 @@ struct Gemma3nSharedKVTests {
                 MLXArray(Array(1 ... 10) + [13, 14, 15]).reshaped(1, 13), cache: nil)
             let expected = fresh[0..., 10..., 0...]
             eval(output, expected)
-            #expect(allClose(output, expected, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+            #expect(allClose(output, expected, rtol: 2e-4, atol: Self.logitsAtol).item(Bool.self))
             #expect(cache.allSatisfy { $0.offset == 13 })
         }
     }
@@ -78,7 +85,7 @@ struct Gemma3nSharedKVTests {
                 MLXArray(Array(1 ... 12) + [13, 14, 16]).reshaped(1, 15), cache: nil)
             let fresh = freshLogits[0..., 14..., 0...]
             eval(next, fresh)
-            #expect(allClose(next, fresh, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+            #expect(allClose(next, fresh, rtol: 2e-4, atol: Self.logitsAtol).item(Bool.self))
         }
     }
 
@@ -115,7 +122,8 @@ struct Gemma3nSharedKVTests {
                 )
                 .transposed(0, 2, 1, 3).reshaped(1, count, -1))
             eval(output, expected)
-            #expect(allClose(output, expected, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+            #expect(
+                allClose(output, expected, rtol: 2e-4, atol: Self.attentionAtol).item(Bool.self))
             #expect(cache.offset == count)
         }
     }

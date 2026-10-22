@@ -180,7 +180,9 @@ struct EmbeddingGemma2Tests {
             0.049736522, 0.164332777, 0.185940713, 0.187425271, 0.166393027, 0.134533703,
         ]
         #expect(result.shape == [1, 12])
-        #expect(zip(result.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < 0.00001 })
+        // TF32 matmuls leave ~3e-3 against the float32 reference; see MatmulPrecision.
+        let tolerance: Float = MatmulPrecision.tolerance(float32: 0.00001, reduced: 0.01)
+        #expect(zip(result.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < tolerance })
     }
 
     @Test
@@ -529,14 +531,17 @@ struct EmbeddingGemma2Tests {
         let batched = model.embed(inputIds: ids, attentionMask: mask)
         try MLX.checkedEval(batched)
         #expect(batched.shape == [2, 12])
+        // TF32 matmuls leave ~3e-3 against the float32 reference; see MatmulPrecision.
+        let tolerance: Float = MatmulPrecision.tolerance(float32: 0.00001, reduced: 0.01)
         #expect(
             zip(batched.asArray(Float.self), expected.flatMap { $0 }).allSatisfy {
-                abs($0 - $1) < 0.00001
+                abs($0 - $1) < tolerance
             })
 
         let single = model.embed(inputIds: ids[1..., 0 ..< 6], attentionMask: mask[1..., 0 ..< 6])
         try MLX.checkedEval(single)
-        #expect(zip(single.asArray(Float.self), expected[1]).allSatisfy { abs($0 - $1) < 0.00001 })
+        #expect(
+            zip(single.asArray(Float.self), expected[1]).allSatisfy { abs($0 - $1) < tolerance })
     }
 
     /// Expected row comes from the Transformers float32 implementation with the same
@@ -567,7 +572,9 @@ struct EmbeddingGemma2Tests {
             0.868728220, 0.079042479, -0.071267642, 0.054610837, -0.041429795, -0.136714175,
             -0.154088214, -0.177199394, -0.185128003, -0.179980844, -0.219441086, -0.201574326,
         ]
-        #expect(zip(output.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < 0.00001 })
+        // TF32 matmuls leave ~2e-4 against the float32 reference; see MatmulPrecision.
+        let tolerance: Float = MatmulPrecision.tolerance(float32: 0.00001, reduced: 0.001)
+        #expect(zip(output.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < tolerance })
     }
 
     /// A tiny `gemma4_audio` tower: chunks of 4 over 11 soft tokens, so the attention
@@ -630,7 +637,9 @@ struct EmbeddingGemma2Tests {
         try MLX.checkedEval(output)
         #expect(output.shape == [1, 11, 8])
         let expected = try #require(Self.tinyAudioReference[futureContext])
-        #expect(zip(output.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < 0.00001 })
+        // TF32 matmuls leave ~4e-3 against the float32 reference; see MatmulPrecision.
+        let tolerance: Float = MatmulPrecision.tolerance(float32: 0.00001, reduced: 0.02)
+        #expect(zip(output.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < tolerance })
     }
 
     /// Writes `processor_config.json` into a new temporary directory.
@@ -677,9 +686,11 @@ struct EmbeddingGemma2Tests {
         let features = processor.features(samples: MLXArray(samples))
         try MLX.checkedEval(features)
         #expect(features.shape == [11, 8])
+        // TF32 matmuls leave ~1e-3 against the float32 reference; see MatmulPrecision.
+        let tolerance: Float = MatmulPrecision.tolerance(float32: 0.0001, reduced: 0.005)
         #expect(
             zip(features.asArray(Float.self), Self.tinyLogMelReference).allSatisfy {
-                abs($0 - $1) < 0.0001
+                abs($0 - $1) < tolerance
             })
     }
 
@@ -1063,9 +1074,10 @@ extension EmbeddingGemma2Tests {
         eval(output)
         #expect(output.dtype == .float32)
         let key = dtype == .float32 ? "float32" : "bf16"
-        #expect(
-            allClose(output, expected[key]!, atol: dtype == .float32 ? 1e-6 : 2e-3).all().item(
-                Bool.self))
+        // The fixture was pinned by Python mlx-vlm with TF32 on, so float32 matches it only on
+        // TF32 hardware; IEEE float32 lands 1.6e-3 away. Regenerate under both regimes to tighten.
+        let atol = dtype == .float32 && MatmulPrecision.isReducedFloat32 ? 1e-6 : 2e-3
+        #expect(allClose(output, expected[key]!, atol: atol).all().item(Bool.self))
         #expect(
             allClose(sum(output * output, axis: 1), MLXArray.ones([2]), atol: 1e-6).all().item(
                 Bool.self))

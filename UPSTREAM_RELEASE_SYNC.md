@@ -28,7 +28,21 @@ Public API changes inherited from upstream: the Qwen 3.5/3.8 `sanitize(weights:)
 
 ## Validation
 
-See the PR for the build and test record on this baseline.
+Xcode 27.0 / Swift 6.4. `swift build --build-tests`, then `mlx.metallib` compiled from the sibling's
+`Source/Cmlx/mlx-generated/metal/*.metal` with MLX's kernel flags (`-Wall -Wextra -fno-fast-math
+-Wno-c++17-extensions -Wno-c++20-extensions`) and copied into every `*.xctest` bundle, then
+`swift test --skip-build --no-parallel` under the default TF32 setting and once more with
+`MLX_ENABLE_TF32=0`. Both must pass.
+
+TF32: this host (M5 class) runs float32 matmuls as TF32 by default. Upstream's
+`Tests/MLXLMTests/MatmulPrecision.swift` (#649) measures that and adapts tolerances, and its policy
+is not to pin `MLX_ENABLE_TF32=0`. Upstream CI runs on pre-M5 hardware, so eleven upstream tests
+written after #649 kept fixed IEEE bounds and failed here with TF32 on (Gemma3nSharedKV,
+VLMTextOnlyContinuation, Mellum, and the upstream EmbeddingGemma2 reference tests). They now use
+`MatmulPrecision` with bounds measured on this host; the IEEE bounds are unchanged. The fork's
+EmbeddingGemma 2 fixture was pinned from Python mlx-vlm with TF32 on, so its float32 pinned test
+keeps 1e-6 under TF32 and uses 2e-3 under IEEE float32; regenerating the fixture under both
+regimes would tighten it. Results are in the PR.
 
 # Published release sync — 2026-10-05
 

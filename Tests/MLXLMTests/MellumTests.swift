@@ -131,7 +131,10 @@ final class MellumTests: XCTestCase {
         let incremental = concatenated([prefill] + steps, axis: 1)
 
         XCTAssertEqual(cache.map(\.offset), [8, 8, 8])
-        XCTAssertTrue(allClose(incremental, full, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+        // TF32 matmuls leave ~4e-3 between the incremental and full logits; see MatmulPrecision.
+        let tolerance: Double = MatmulPrecision.tolerance(float32: 1e-4, reduced: 2e-2)
+        XCTAssertTrue(
+            allClose(incremental, full, rtol: tolerance, atol: tolerance).item(Bool.self))
     }
 
     func testQuantizedKVCacheOnFullAttention() throws {

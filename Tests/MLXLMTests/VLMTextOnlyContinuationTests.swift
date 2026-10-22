@@ -177,14 +177,19 @@ struct VLMTextOnlyContinuationTests {
         let expected = try prepare(
             model, tokens: MLXArray((1 ... 9).map(Int32.init)).expandedDimensions(axis: 0),
             cache: referenceCache, prefill: .init(chunking: .unchunked))
+        // The cached suffix and the full prompt reach the same logits through differently
+        // shaped matmuls; TF32 leaves a few times 1e-3 between them. See MatmulPrecision.
+        let tolerance: Double = MatmulPrecision.tolerance(float32: 1e-4, reduced: 2e-2)
         #expect(
-            allClose(actual[0..., -1, 0...], expected[0..., -1, 0...], rtol: 1e-4, atol: 1e-4)
-                .item(Bool.self))
+            allClose(
+                actual[0..., -1, 0...], expected[0..., -1, 0...], rtol: tolerance, atol: tolerance
+            )
+            .item(Bool.self))
         let token = MLXArray([Int32(11)]).expandedDimensions(axis: 0)
         let decoded = model(token, cache: cache)
         let reference = model(token, cache: referenceCache)
         eval(decoded, reference, cache, referenceCache)
-        #expect(allClose(decoded, reference, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+        #expect(allClose(decoded, reference, rtol: tolerance, atol: tolerance).item(Bool.self))
         #expect(cache.allSatisfy { $0.offset == 10 })
     }
 
