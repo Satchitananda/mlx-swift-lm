@@ -9,8 +9,10 @@ import Testing
 /// The audio features are built on one thread and consumed on another: the processor prepares
 /// them on its own executor, the token iterator evaluates them wherever it runs. Every op in the
 /// pipeline must stay on the caller's (thread-unsafe, process-wide) stream. The core's `rfft`
-/// padding path recorded its `slice_update` on the calling thread's default stream, which made the
-/// graph unevaluable from any other thread ("There is no Stream(gpu, N) in current thread").
+/// padding path once recorded its `slice_update` on the calling thread's default stream, which
+/// made the graph unevaluable from any other thread ("There is no Stream(gpu, N) in current
+/// thread"). The core fix (ml-explore/mlx#4746) is carried by this fork's `mlx-swift`; these tests
+/// keep the production path on that contract.
 private final class ArrayBox: @unchecked Sendable {
     let values: [MLXArray]
     init(_ values: [MLXArray]) { self.values = values }
