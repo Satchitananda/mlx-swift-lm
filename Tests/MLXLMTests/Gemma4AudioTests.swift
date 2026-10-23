@@ -50,7 +50,7 @@ struct Gemma4AudioTests {
     /// (the SSCP `INPUT_FEAT_SIZE`), so the frequency reduction 128→64→32 holds.
     private static func audioConfig(
         hiddenSize: Int = 64, layers: Int = 2, outputProjDims: Int? = 48
-    ) -> Gemma4AudioConfiguration {
+    ) -> MLXVLM.Gemma4AudioConfiguration {
         let json = """
             {
               "model_type": "gemma4_audio",
@@ -72,7 +72,7 @@ struct Gemma4AudioTests {
             }
             """
         return try! JSONDecoder().decode(
-            Gemma4AudioConfiguration.self, from: Data(json.utf8))
+            MLXVLM.Gemma4AudioConfiguration.self, from: Data(json.utf8))
     }
 
     /// Expected subsampled time length after the two stride-2 SSCP conv blocks
@@ -95,7 +95,7 @@ struct Gemma4AudioTests {
               "output_proj_dims": 1536, "use_clipped_linears": true
             }
             """
-        let c = try! JSONDecoder().decode(Gemma4AudioConfiguration.self, from: Data(json.utf8))
+        let c = try! JSONDecoder().decode(MLXVLM.Gemma4AudioConfiguration.self, from: Data(json.utf8))
         #expect(c.hiddenSize == 1024)
         #expect(c.hiddenLayers == 12)
         #expect(c.attentionHeads == 8)
@@ -152,7 +152,7 @@ struct Gemma4AudioTests {
 
     @Test("audio_tower module tree exposes the checkpoint weight keys")
     func audioTowerExposesCheckpointWeightKeys() {
-        let model = Gemma4AudioModel(config: Self.audioConfig(layers: 2))
+        let model = MLXVLM.Gemma4AudioModel(config: Self.audioConfig(layers: 2))
         let keys = Set(model.parameters().flattened().map(\.0))
 
         // SSCP: two conv blocks (Conv2d weight + LayerNorm weight) and the projection.
@@ -186,13 +186,13 @@ struct Gemma4AudioTests {
 
     @Test("A synthetic audio_tower checkpoint round-trips through the strict loader")
     func audioTowerRoundTripsSyntheticCheckpoint() throws {
-        let source = Gemma4AudioModel(config: Self.audioConfig(layers: 2))
+        let source = MLXVLM.Gemma4AudioModel(config: Self.audioConfig(layers: 2))
         eval(source)
         var checkpoint = [String: MLXArray]()
         for (key, value) in source.parameters().flattened() {
             checkpoint[key] = value
         }
-        let model = Gemma4AudioModel(config: Self.audioConfig(layers: 2))
+        let model = MLXVLM.Gemma4AudioModel(config: Self.audioConfig(layers: 2))
         // `[.all]` is what MLXLMCommon.loadWeights applies — throws on any module
         // parameter with no matching weight, or any leftover unmatched weight.
         try model.update(
@@ -205,7 +205,7 @@ struct Gemma4AudioTests {
     @Test("Encoder subsamples time 4× and projects to output_proj_dims")
     func audioTowerForwardShapeAndSubsampling() {
         let config = Self.audioConfig(layers: 2, outputProjDims: 48)
-        let model = Gemma4AudioModel(config: config)
+        let model = MLXVLM.Gemma4AudioModel(config: config)
         eval(model)
 
         let t = 50
@@ -222,7 +222,7 @@ struct Gemma4AudioTests {
     @Test("Encoder without output_proj keeps hidden_size and stays finite")
     func audioTowerNoOutputProjKeepsHidden() {
         let config = Self.audioConfig(hiddenSize: 64, layers: 2, outputProjDims: nil)
-        let model = Gemma4AudioModel(config: config)
+        let model = MLXVLM.Gemma4AudioModel(config: config)
         eval(model)
 
         let mel = MLXRandom.normal([1, 40, 128])
@@ -239,7 +239,7 @@ struct Gemma4AudioTests {
     @Test("Padding frames are zeroed in the encoder output")
     func audioTowerZeroesPaddedFrames() {
         let config = Self.audioConfig(layers: 2, outputProjDims: 48)
-        let model = Gemma4AudioModel(config: config)
+        let model = MLXVLM.Gemma4AudioModel(config: config)
         eval(model)
 
         let t = 50
@@ -334,7 +334,7 @@ struct Gemma4AudioTests {
     @Test("Extractor token count matches the tower's valid subsampled frames")
     func extractorTowerFrameCountConsistency() {
         let extractor = Gemma4AudioFeatureExtractor()
-        let model = Gemma4AudioModel(config: Self.audioConfig(layers: 2))
+        let model = MLXVLM.Gemma4AudioModel(config: Self.audioConfig(layers: 2))
         eval(model)
 
         for samples in [8_000, 16_000, 24_000] {

@@ -104,6 +104,7 @@ public enum LLMTypeRegistry {
         "olmoe": create(OlmoEConfiguration.self, OlmoEModel.init),
         "olmo2": create(Olmo2Configuration.self, Olmo2Model.init),
         "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
+        "mellum": create(MellumConfiguration.self, MellumModel.init),
         "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
@@ -380,6 +381,11 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let mellum2_1_12b_a2_5b_thinking_6bit = ModelConfiguration(
+        id: "mlx-community/Mellum2.1-12B-A2.5B-Thinking-6bit",
+        defaultPrompt: "Write a Swift function that checks whether a string is a palindrome."
+    )
+
     static public let openelm270m4bit = ModelConfiguration(
         id: "mlx-community/OpenELM-270M-Instruct",
         // https://huggingface.co/apple/OpenELM
@@ -574,6 +580,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3_6_27b_4bit,
             qwen3_8_27b_4bit,
             qwen3_8_27b_8bit,
+            mellum2_1_12b_a2_5b_thinking_6bit,
             smolLM_135M_4bit,
             deepseek_r1_4bit,
             mimo_7b_sft_4bit,
@@ -730,6 +737,11 @@ public final class LLMModelFactory: GenericModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
+        // Honor `suppress_tokens` from generation_config.json (transformers'
+        // SuppressTokensLogitsProcessor): merge into the model's suppressed
+        // token IDs so the token iterators mask them during sampling.
+        mergeGenerationConfigSuppressedTokens(parsedGenerationConfig, into: model)
+
         // Build a ModelConfiguration with loaded EOS token IDs and tool call format
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
@@ -758,7 +770,8 @@ public final class LLMModelFactory: GenericModelFactory {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents)
 
         let tokenizer = try await tokenizerTask
 
