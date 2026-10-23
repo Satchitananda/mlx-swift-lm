@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import CoreImage
 import CoreMedia
 import Foundation
 import MLX
@@ -1027,5 +1028,151 @@ extension EmbeddingGemma2Tests {
         #expect(
             gate.withLock { queue.hasPrefix("com.apple.root.") && !queue.contains("cooperative") })
         #expect(model.onDemandComponents.first { $0.component == .vision }?.isLoaded == false)
+    }
+}
+
+// MARK: - Shared video
+
+extension EmbeddingGemma2Tests {
+    /// `processor_config.json` for the tiny media checkpoint: 8-pixel pooling cells with a
+    /// 16-token image and 4-token video-frame budget, and the 4 kHz 8-bin feature extractor
+    /// of the log-mel reference.
+    private static let tinyProcessorConfig =
+        #"{"processor_class":"Gemma4Processor","do_normalize":false,"patch_size":4,"pooling_kernel_size":2,"max_soft_tokens":16,"video_processor":{"fps":1.0,"max_frames":4,"max_soft_tokens":4,"overflow_strategy":"uniform","add_timestamps":false},"feature_extractor":{"feature_size":8,"sampling_rate":4000,"frame_length":80,"hop_length":40,"fft_length":128,"min_frequency":0.0,"max_frequency":2000.0,"mel_floor":0.001,"preemphasis":0.0,"input_scale_factor":1.0,"per_bin_mean":null,"per_bin_stddev":null}}"#
+
+    /// The tiny media checkpoint with a processor configuration, ready for the public actor.
+    private static func mediaActor() async throws -> (URL, EmbeddingGemma2Embedding) {
+        let directory = try mediaCheckpoint().directory
+        try Data(tinyProcessorConfig.utf8).write(
+            to: directory.appendingPathComponent("processor_config.json"))
+        let actor = try await EmbeddingGemma2Embedding(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        return (directory, actor)
+    }
+
+    /// 24×24 frames of distinct solid colors; without a frame rate all of them are sampled.
+    private static func syntheticVideo(frames: Int) -> UserInput.Video {
+        .init(
+            source: .frames(
+                (0 ..< frames).map { index in
+                    let color = CIColor(
+                        red: CGFloat(index + 1) / CGFloat(frames + 1),
+                        green: CGFloat(frames - index) / CGFloat(frames + 1), blue: 0.5)
+                    return UserInput.VideoFrame(
+                        image: .init(
+                            source: .ciImage(
+                                CIImage(color: color).cropped(
+                                    to: CGRect(x: 0, y: 0, width: 24, height: 24)))),
+                        timeStamp: CMTime(value: CMTimeValue(index), timescale: 1))
+                }))
+    }
+
+    /// Two tones at 4 kHz, long enough for the audio tower's subsampling.
+    private static func syntheticAudio() -> UserInput.Audio {
+        let samples: [Float] = (0 ..< 1650).map { index in
+            let time = Double(index) / 4000
+            let low: Double = 0.6 * sin(2 * Double.pi * 440 * time)
+            let high: Double = 0.3 * sin(2 * Double.pi * 1250 * time)
+            return Float(low + high)
+        }
+        return .init(source: .array(MLXArray(samples)))
+    }
+
+    /// Fresh variants for each call: a visual lane, a combined lane, a titled text lane and
+    /// one without video. `.sharedVideo` becomes `.video(video)` when a video is given, so the
+    /// same lanes can be embedded independently. Inputs are not `Sendable`, hence new values.
+    private static func lanes(video: UserInput.Video? = nil) -> [EmbeddingGemma2Embedding.Input]
+    {
+        let clip: EmbeddingGemma2Embedding.Input.Part = video.map(Part.video) ?? .sharedVideo
+        return [
+            .init([clip]),
+            .init([clip, .audio(syntheticAudio())]),
+            .init([.text("Aurora over Tromsø: "), clip], title: "Night sky"),
+            .init(text: "No video in this lane"),
+        ]
+    }
+
+    private typealias Part = EmbeddingGemma2Embedding.Input.Part
+
+    /// Each variant of a sharing call equals the independent embedding with `.video` in the
+    /// `.sharedVideo` position, element for element: the same lazy graph is evaluated in the
+    /// same order, so no tolerance is needed, under TF32 or IEEE float32 alike.
+    @Test
+    func sharedVideoVariantsMatchIndependentEmbeddings() async throws {
+        let (directory, actor) = try await Self.mediaActor()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let shared = try await actor.embed(
+            sharingVideo: Self.syntheticVideo(frames: 3), variants: Self.lanes(), task: .document)
+        let independent = try await actor.embed(
+            Self.lanes(video: Self.syntheticVideo(frames: 3)), task: .document)
+        #expect(shared.count == 4)
+        #expect(shared.allSatisfy { $0.count == 12 })
+        #expect(shared == independent)
+        // The lanes embed different sequences, so sharing did not collapse them.
+        #expect(shared[0] != shared[1])
+        #expect(shared[0] != shared[2])
+        let truncated = try await actor.embed(
+            sharingVideo: Self.syntheticVideo(frames: 3), variants: [Self.lanes()[1]],
+            task: .document, dimensions: 12)
+        #expect(truncated == [shared[1]])
+    }
+
+    /// `.sharedVideo` is rejected outside a sharing call and twice within one variant, and a
+    /// sharing call is rejected without variants or video support, all before any frame is
+    /// decoded: the empty video would otherwise throw `invalidMedia`.
+    @Test
+    func sharedVideoPlaceholderIsValidatedBeforeDecoding() async throws {
+        let (directory, actor) = try await Self.mediaActor()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // An empty video throws `invalidMedia` as soon as it is decoded.
+        func undecodable() -> UserInput.Video { .init(source: .frames([])) }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.misplacedSharedVideo) {
+            try await actor.embed(.init([.sharedVideo]), task: .none)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.misplacedSharedVideo) {
+            try await actor.embed(.init([.text("Clip"), .sharedVideo]), task: .document)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.misplacedSharedVideo) {
+            try await actor.embed(
+                sharingVideo: undecodable(),
+                variants: [.init([.sharedVideo]), .init([.sharedVideo, .text("x"), .sharedVideo])],
+                task: .none)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.emptyInput) {
+            try await actor.embed(sharingVideo: undecodable(), variants: [], task: .none)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.emptyInput) {
+            try await actor.embed(
+                sharingVideo: undecodable(), variants: [.init([.sharedVideo]), .init(text: " ")],
+                task: .none)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.invalidDimension) {
+            try await actor.embed(
+                sharingVideo: undecodable(), variants: [.init([.sharedVideo])], task: .none,
+                dimensions: 7)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.invalidMedia) {
+            try await actor.embed(
+                sharingVideo: undecodable(), variants: [.init([.sharedVideo])], task: .none)
+        }
+
+        // Image-only vision has no video token; an excluded encoder has no video at all.
+        let imageOnly = try Self.checkpointDirectory(Self.tinyVisionConfig)
+        defer { try? FileManager.default.removeItem(at: imageOnly) }
+        let imageActor = try await EmbeddingGemma2Embedding(
+            modelDirectory: imageOnly, tokenizerLoader: TestTokenizerLoader())
+        #expect(await imageActor.supportedModalities == [.text, .image])
+        await #expect(throws: EmbeddingGemma2Embedding.Error.unsupportedMedia) {
+            try await imageActor.embed(
+                sharingVideo: Self.syntheticVideo(frames: 1), variants: [.init([.sharedVideo])],
+                task: .none)
+        }
+        let textOnly = try await EmbeddingGemma2Embedding(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader(), loadVision: false)
+        await #expect(throws: EmbeddingGemma2Embedding.Error.unsupportedMedia) {
+            try await textOnly.embed(
+                sharingVideo: Self.syntheticVideo(frames: 1), variants: [.init(text: "Swift")],
+                task: .none)
+        }
     }
 }
