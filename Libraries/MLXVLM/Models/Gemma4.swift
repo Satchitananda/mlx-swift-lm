@@ -6,9 +6,12 @@ import MLXNN
 
 // Based on https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/gemma4
 
-private enum Gemma4Error: LocalizedError {
+/// Module-internal — also thrown by the shared audio helper (`Gemma4AudioInput.swift`).
+enum Gemma4Error: LocalizedError, Equatable {
     case multimodalTokenCountMismatch(kind: String, featureTokens: Int, promptTokens: Int)
     case imagePlaceholderMismatch(images: Int, placeholders: Int)
+    case audioPlaceholderMismatch(audios: Int, placeholders: Int)
+    case audioDelimiterTokensUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -18,6 +21,12 @@ private enum Gemma4Error: LocalizedError {
         case .imagePlaceholderMismatch(let images, let placeholders):
             return
                 "Gemma4 image placeholder mismatch: the request has \(images) images but the prompt contains at least \(placeholders) image placeholders."
+        case .audioPlaceholderMismatch(let audios, let placeholders):
+            return
+                "Gemma4 audio placeholder mismatch: the request has \(audios) audio clips but the prompt contains \(placeholders) audio placeholders."
+        case .audioDelimiterTokensUnavailable:
+            return
+                "Gemma4 audio delimiters unavailable: the processor configuration has no boa_token_id/eoa_token_id and the tokenizer does not know \(Gemma4AudioInput.boaToken) / \(Gemma4AudioInput.eoaToken)."
         }
     }
 }
@@ -2342,7 +2351,7 @@ public struct Gemma4Processor: UserInputProcessor {
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
 
-        if input.images.isEmpty, input.videos.isEmpty {
+        if input.images.isEmpty, input.videos.isEmpty, input.audios.isEmpty {
             // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
             return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         }
@@ -2401,27 +2410,18 @@ public struct Gemma4Processor: UserInputProcessor {
 
         var processedAudio: LMInput.ProcessedAudio?
         if !input.audios.isEmpty {
-            let (audio, tokenCounts) = try await prepareAudio(input.audios)
+            // Log-mel features for the USM audio tower. Each placeholder becomes
+            // `boa + audio_soft_token×N + eoa`, N being the tower's soft-token count
+            // for that clip's valid frames.
+            let extractor = Gemma4AudioFeatureExtractor(sampleRate: config.audioSampleRate)
+            let (audio, softTokenCounts) = try await Gemma4AudioInput.prepare(
+                input.audios, sampleRate: config.audioSampleRate
+            ) { extractor.clipFeatures($0, maxSoftTokens: config.audioSeqLength) }
             processedAudio = audio
-            // Expand each audio placeholder into `boa + audio_soft_token×N + eoa`,
-            // where N is the encoder's soft-token count for that clip's valid frames.
-            var expandedTokens: [Int] = []
-            var audioIndex = 0
-            for token in promptTokens {
-                if token == config.audioTokenId {
-                    let count =
-                        audioIndex < tokenCounts.count
-                        ? tokenCounts[audioIndex] : config.audioSeqLength
-                    expandedTokens.append(config.boaTokenId)
-                    expandedTokens.append(
-                        contentsOf: Array(repeating: config.audioTokenId, count: count))
-                    expandedTokens.append(config.eoaTokenId)
-                    audioIndex += 1
-                } else {
-                    expandedTokens.append(token)
-                }
-            }
-            promptTokens = expandedTokens
+            promptTokens = try Gemma4AudioInput.expandPlaceholders(
+                in: promptTokens, audioTokenId: config.audioTokenId,
+                boaTokenId: config.boaTokenId, eoaTokenId: config.eoaTokenId,
+                softTokenCounts: softTokenCounts)
         }
 
         var processedVideo: LMInput.ProcessedVideo?
@@ -2460,56 +2460,6 @@ public struct Gemma4Processor: UserInputProcessor {
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: processedImage, video: processedVideo, audio: processedAudio)
-    }
-
-    /// Extracts log-mel features for each audio clip and stacks them into a batch,
-    /// returning the `ProcessedAudio` and per-clip audio soft-token counts (for
-    /// prompt expansion). Clips are resampled to the model's audio sample rate.
-    private func prepareAudio(
-        _ audios: [UserInput.Audio]
-    ) async throws -> (LMInput.ProcessedAudio, [Int]) {
-        let extractor = Gemma4AudioFeatureExtractor(sampleRate: config.audioSampleRate)
-        var processing = UserInput.AudioProcessing()
-        processing.sampleRate = Double(config.audioSampleRate)
-
-        var featureRows: [MLXArray] = []
-        var maskRows: [MLXArray] = []
-        var tokenCounts: [Int] = []
-        for audio in audios {
-            let waveform = try await audio.asMLXArray(processing: processing)
-            let (features, mask) = extractor(waveform)
-            featureRows.append(features)
-            maskRows.append(mask)
-            let validFrames = mask.asType(.int32).sum().item(Int.self)
-            tokenCounts.append(
-                min(
-                    Gemma4AudioFeatureExtractor.audioTokenCount(validFrames: validFrames),
-                    config.audioSeqLength))
-        }
-
-        let maxFrames = featureRows.map { $0.dim(1) }.max() ?? 0
-        var paddedFeatures: [MLXArray] = []
-        var paddedMasks: [MLXArray] = []
-        for (features, mask) in zip(featureRows, maskRows) {
-            let t = features.dim(1)
-            if t < maxFrames {
-                paddedFeatures.append(
-                    padded(features, widths: [0, IntOrPair((0, maxFrames - t)), 0]))
-                paddedMasks.append(
-                    padded(mask.asType(.int32), widths: [0, IntOrPair((0, maxFrames - t))])
-                        .asType(.bool))
-            } else {
-                paddedFeatures.append(features)
-                paddedMasks.append(mask)
-            }
-        }
-
-        return (
-            LMInput.ProcessedAudio(
-                features: concatenated(paddedFeatures, axis: 0),
-                mask: concatenated(paddedMasks, axis: 0)),
-            tokenCounts
-        )
     }
 }
 
@@ -2713,6 +2663,13 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     public let imageSeqLength: Int
     public let audioSeqLength: Int
     public let audioMsPerToken: Int
+    /// `feature_extractor.sampling_rate`; audio clips are decoded at this rate.
+    public let audioSampleRate: Int
+    /// Raw samples per audio soft token: `feature_extractor.audio_samples_per_token`, else
+    /// `audio_ms_per_token` × `audioSampleRate` / 1000 (40 ms × 16 kHz = 640). This is the
+    /// frame width of the encoder-free unified audio path and the input width of the
+    /// checkpoint's `embed_audio` projection.
+    public let audioSamplesPerToken: Int
     public let patchSize: Int
     public let poolingKernelSize: Int
     public let modelPatchSize: Int
@@ -2723,6 +2680,21 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     public let videoTokenId: Int?
     public let boiTokenId: Int
     public let eoiTokenId: Int?
+    /// Audio delimiters. Unified processor configurations usually carry neither id; the
+    /// processor then resolves `<|audio>` / `<audio|>` through the tokenizer.
+    public let boaTokenId: Int?
+    public let eoaTokenId: Int?
+
+    /// Audio keys nested under `feature_extractor` in processor_config.json.
+    private struct FeatureExtractorConfiguration: Decodable, Sendable {
+        let samplingRate: Int?
+        let audioSamplesPerToken: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case samplingRate = "sampling_rate"
+            case audioSamplesPerToken = "audio_samples_per_token"
+        }
+    }
 
     private struct ImageProcessorConfiguration: Decodable, Sendable {
         let doResize: Bool?
@@ -2777,12 +2749,17 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         case videoTokenId = "video_token_id"
         case boiTokenId = "boi_token_id"
         case eoiTokenId = "eoi_token_id"
+        case boaTokenId = "boa_token_id"
+        case eoaTokenId = "eoa_token_id"
+        case featureExtractor = "feature_extractor"
     }
 
     public init(from decoder: any Swift.Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let imageProcessor = try c.decodeIfPresent(
             ImageProcessorConfiguration.self, forKey: CodingKeys.imageProcessor)
+        let featureExtractor = try c.decodeIfPresent(
+            FeatureExtractorConfiguration.self, forKey: CodingKeys.featureExtractor)
 
         processorClass =
             try c.decodeIfPresent(String.self, forKey: CodingKeys.processorClass)
@@ -2835,6 +2812,16 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
             try c.decodeIfPresent(Int.self, forKey: CodingKeys.audioSeqLength) ?? 750
         audioMsPerToken =
             try c.decodeIfPresent(Int.self, forKey: CodingKeys.audioMsPerToken) ?? 40
+        audioSampleRate = featureExtractor?.samplingRate ?? 16_000
+        audioSamplesPerToken =
+            featureExtractor?.audioSamplesPerToken ?? audioMsPerToken * audioSampleRate / 1000
+        guard audioSamplesPerToken > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: CodingKeys.audioMsPerToken, in: c,
+                debugDescription:
+                    "audio_samples_per_token must be positive (audio_ms_per_token \(audioMsPerToken) at \(audioSampleRate) Hz)"
+            )
+        }
         size =
             try c.decodeIfPresent(
                 Gemma3ProcessorConfiguration.ImageSize.self, forKey: CodingKeys.size)
@@ -2844,6 +2831,8 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         videoTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.videoTokenId) ?? 258_884
         boiTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.boiTokenId) ?? 255_999
         eoiTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.eoiTokenId) ?? 258_882
+        boaTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.boaTokenId)
+        eoaTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.eoaTokenId)
     }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
@@ -3003,7 +2992,7 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
 
-        if input.images.isEmpty {
+        if input.images.isEmpty, input.audios.isEmpty {
             // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
             return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         }
@@ -3044,9 +3033,48 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
             promptTokens = expandedTokens
         }
 
+        var processedAudio: LMInput.ProcessedAudio?
+        if !input.audios.isEmpty {
+            // Encoder-free unified audio: raw frames of `audioSamplesPerToken` samples, one
+            // per soft token. Each placeholder becomes `boa + audio_soft_token×N + eoa`,
+            // N = ceil(samples / audioSamplesPerToken).
+            let (boaTokenId, eoaTokenId) = try audioDelimiterTokenIds()
+            let extractor = Gemma4UnifiedAudioFeatureExtractor(
+                sampleRate: config.audioSampleRate,
+                audioSamplesPerToken: config.audioSamplesPerToken)
+            let (audio, softTokenCounts) = try await Gemma4AudioInput.prepare(
+                input.audios, sampleRate: config.audioSampleRate
+            ) { extractor.clipFeatures($0) }
+            processedAudio = audio
+            promptTokens = try Gemma4AudioInput.expandPlaceholders(
+                in: promptTokens, audioTokenId: config.audioTokenId,
+                boaTokenId: boaTokenId, eoaTokenId: eoaTokenId,
+                softTokenCounts: softTokenCounts)
+        }
+
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
-        return LMInput(text: .init(tokens: promptArray, mask: mask), image: processedImage)
+        return LMInput(
+            text: .init(tokens: promptArray, mask: mask),
+            image: processedImage, video: nil, audio: processedAudio)
+    }
+
+    /// `boa` / `eoa` from the processor configuration, else from the tokenizer's vocabulary
+    /// (`<|audio>` / `<audio|>`): the 12B processor_config.json carries neither id, and a
+    /// silently defaulted delimiter would hand the model a malformed prompt.
+    private func audioDelimiterTokenIds() throws -> (boa: Int, eoa: Int) {
+        func resolve(_ configured: Int?, _ token: String) -> Int? {
+            if let configured { return configured }
+            guard let id = tokenizer.convertTokenToId(token), id != tokenizer.unknownTokenId
+            else { return nil }
+            return id
+        }
+        guard let boa = resolve(config.boaTokenId, Gemma4AudioInput.boaToken),
+            let eoa = resolve(config.eoaTokenId, Gemma4AudioInput.eoaToken)
+        else {
+            throw Gemma4Error.audioDelimiterTokensUnavailable
+        }
+        return (boa, eoa)
     }
 }
 
