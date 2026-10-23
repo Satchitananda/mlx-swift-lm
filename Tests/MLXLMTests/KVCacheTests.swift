@@ -308,6 +308,23 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(metadata["2.0"] == "KVCache")
     }
 
+    @Test func testLoadedPromptCacheNoLongerReadsItsFile() throws {
+        let cache = KVCacheSimple()
+        let keys = MLXArray(0 ..< 32).reshaped([1, 2, 4, 4]).asType(.float32)
+        let values = -keys
+        _ = cache.update(keys: keys, values: values)
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try savePromptCache(url: url, cache: [cache])
+
+        // Saving truncates the file before it evaluates what it writes.
+        let snapshot = try loadPromptCacheSnapshot(url: url)
+        try savePromptCache(url: url, cache: snapshot.cache)
+
+        let restored = try loadPromptCacheSnapshot(url: url)
+        assertArraysClose(restored.cache[0].state, [keys, values])
+    }
+
     @Test func testEmptyPromptCacheStateUsesTheLegacyFormat() throws {
         let cache = KVCacheSimple()
         _ = cache.update(
@@ -1293,6 +1310,38 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         }
     }
 
+    // MARK: - Quantized attention head dims
+    // Regression for #652: MLA caches store [kvLatent, kPe] as keys and only kvLatent as
+    // values, so the GQA output reshape must follow the value head dim, not the query one.
+
+    @Test("quantizedScaledDotProductAttention supports values narrower than keys")
+    func quantizedAttentionSupportsMLAStyleHeadDims() throws {
+        withRandomState(MLXRandom.RandomState(seed: 0)) {
+            let (B, nKVHeads, nRepeats, L) = (1, 1, 4, 3)
+            let (kHeadDim, vHeadDim) = (192, 128)
+            let scale = 1.0 / Float(kHeadDim).squareRoot()
+
+            let q = MLXRandom.normal([B, nKVHeads * nRepeats, L, kHeadDim])
+            let k = MLXRandom.normal([B, nKVHeads, L, kHeadDim])
+            let v = MLXRandom.normal([B, nKVHeads, L, vHeadDim])
+
+            let reference = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: .causal)
+
+            let cache = QuantizedKVCache(groupSize: 64, bits: 8)
+            let (qK, qV) = cache.updateQuantized(keys: k, values: v)
+            let out = quantizedScaledDotProductAttention(
+                queries: q, quantizedKeys: qK, quantizedValues: qV,
+                scale: scale, mask: .causal,
+                groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
+
+            #expect(out.shape == reference.shape)
+            #expect(
+                allClose(out, reference, rtol: 0.05, atol: 0.1).item(Bool.self),
+                "quantized MLA attention diverges from full precision")
+        }
+    }
+
     // MARK: - ropeOffset overridability
 
     /// A `BaseKVCache` subclass reporting a per-row RoPE offset, as a batched cache does.
@@ -1377,6 +1426,14 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
 
         let short = try #require(cache.logicalView(tail: 3))
         #expect(encodedPositions(short.0) == [17, 18, 19], "a short tail took the wrong end")
+    }
+
+    @Test func testRotatingKVCacheReportsEvictedTokensThroughKVCache() {
+        let rotating = RotatingKVCache(maxSize: 8, keep: 2)
+        fillOneAtATime(rotating, positions: 0 ..< 20)
+
+        let cache: any KVCache = rotating
+        #expect(cache.evictedTokenCount == 12)
     }
 
     @Test func testRotatingLogicalViewClampsTailToWhatTheCacheHolds() throws {
@@ -1564,6 +1621,19 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(cache.state.count == 10)
         #expect(relativeRMSError(cachedKeys, keys) < 0.5)
         #expect(relativeRMSError(cachedValues, values) < 0.5)
+    }
+
+    @Test func testVarianceNormalizedKVCacheInnerStateHoldsTheStoredSlabs() throws {
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
+        let keys = MLXRandom.normal([1, 1, 8 * 32 + 5, 32]).asType(.float16)
+        let values = MLXRandom.normal([1, 1, 8 * 32 + 5, 32]).asType(.float16)
+        let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        eval(cachedKeys, cachedValues)
+
+        let stateBytes = cache.state.reduce(0) { $0 + $1.nbytes }
+        #expect(KVCacheStatus(cache: [cache]).memoryBytes == stateBytes)
+        #expect(cache.innerState().count < cache.state.count)
     }
 
     @Test func testVarianceNormalizedKVCacheSerializationRoundTrip() throws {

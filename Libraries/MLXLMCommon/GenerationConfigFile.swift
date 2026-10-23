@@ -10,9 +10,15 @@ import Foundation
 ///
 /// Also surfaces recommended sampling parameters (`temperature`, `top_k`, `top_p`)
 /// so callers can apply model-card defaults instead of hardcoded values.
+///
+/// It can also declare `suppress_tokens`: token IDs that must never be sampled
+/// during generation (see `SuppressTokensLogitsProcessor` in Hugging Face
+/// transformers). Model factories merge these into the model's
+/// ``SuppressedTokensProviding/suppressedTokenIds``.
 public struct GenerationConfigFile: Codable, Sendable {
     public var eosTokenIds: IntOrIntArray?
     public var stopStrings: Set<String>
+    public var suppressTokens: IntOrIntArray?
     public var temperature: Float?
     public var topK: Int?
     public var topP: Float?
@@ -21,19 +27,25 @@ public struct GenerationConfigFile: Codable, Sendable {
         case eosTokenIds = "eos_token_id"
         case stopStrings = "stop_strings"
         case stop
+        case suppressTokens = "suppress_tokens"
         case temperature = "temperature"
         case topK = "top_k"
         case topP = "top_p"
     }
 
-    public init(eosTokenIds: IntOrIntArray? = nil, stopStrings: Set<String> = []) {
+    public init(
+        eosTokenIds: IntOrIntArray? = nil, stopStrings: Set<String> = [],
+        suppressTokens: IntOrIntArray? = nil
+    ) {
         self.eosTokenIds = eosTokenIds
         self.stopStrings = stopStrings
+        self.suppressTokens = suppressTokens
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         eosTokenIds = try container.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
+        suppressTokens = try container.decodeIfPresent(IntOrIntArray.self, forKey: .suppressTokens)
         temperature = try container.decodeIfPresent(Float.self, forKey: .temperature)
         topK = try container.decodeIfPresent(Int.self, forKey: .topK)
         topP = try container.decodeIfPresent(Float.self, forKey: .topP)
@@ -46,6 +58,7 @@ public struct GenerationConfigFile: Codable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(eosTokenIds, forKey: .eosTokenIds)
+        try container.encodeIfPresent(suppressTokens, forKey: .suppressTokens)
         try container.encodeIfPresent(temperature, forKey: .temperature)
         try container.encodeIfPresent(topK, forKey: .topK)
         try container.encodeIfPresent(topP, forKey: .topP)

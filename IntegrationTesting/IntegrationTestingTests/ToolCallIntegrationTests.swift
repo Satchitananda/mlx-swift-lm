@@ -35,6 +35,8 @@ struct ToolCallIntegrationTests {
         try await ToolCallTests.glm4FormatAutoDetection(container: container)
     }
 
+    // GLM-4-9B-0414 emits a markerless `get_weather\n{json-args}` call, which
+    // the .glm4 processor anchors on the declared tool names.
     @Test func glm4EndToEnd() async throws {
         let container = try await models.llmContainer(for: .init(id: IntegrationTestModelIDs.glm4))
         try await ToolCallTests.glm4EndToEndGeneration(container: container)
