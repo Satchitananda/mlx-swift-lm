@@ -2351,7 +2351,7 @@ public struct Gemma4Processor: UserInputProcessor {
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
 
-        if input.images.isEmpty, input.videos.isEmpty {
+        if input.images.isEmpty, input.videos.isEmpty, input.audios.isEmpty {
             // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
             return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         }
@@ -2992,7 +2992,7 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
 
-        if input.images.isEmpty {
+        if input.images.isEmpty, input.audios.isEmpty {
             // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
             return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         }
