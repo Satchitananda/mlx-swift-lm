@@ -1119,10 +1119,11 @@ extension EmbeddingGemma2Tests {
     // Value: protects=shared soft tokens enter the sequence at the placeholder's position, also
     //   after other media and before text/images; `dimensions` reaches every variant; and a
     //   variant failing after the shared encode fails the call without a partial result or
-    //   lasting actor state; fails_when=shared features are concatenated out of part order, the
-    //   prompt is not prepended to a media-first variant, `dimensions` is dropped on the sharing
-    //   path, or a later variant's error is swallowed or leaves cached state that changes the
-    //   next call; why_new=no other test places media before the placeholder, truncates on the
+    //   lasting actor state; fails_when=the sharing path diverges from the independent path for
+    //   any lane (features concatenated out of part order, a media-first variant handled
+    //   differently), `dimensions` is dropped on the sharing path, or a later variant's error is
+    //   swallowed or leaves cached state that changes the next call;
+    //   why_new=no other test places media before the placeholder, truncates on the
     //   sharing path, or fails a variant after the shared encode; seam=none;
     //   no_claim=does not show the vision tower ran once, nor that shared features are freed.
     @Test

@@ -641,8 +641,10 @@ public actor EmbeddingGemma2Embedding {
     ///   a variant with neither text nor media, ``Error/unsupportedMedia`` when the
     ///   checkpoint cannot embed video or a variant's own media, ``Error/invalidDimension``,
     ///   and ``Error/misplacedSharedVideo`` for a variant with two `.sharedVideo` parts.
-    ///   Each variant is then embedded like ``embed(_:task:dimensions:)`` and throws the
-    ///   same errors; one failing variant fails the whole call without a partial result.
+    ///   The video is then decoded and encoded once, whether or not a variant refers to
+    ///   it, throwing ``Error/invalidMedia`` or ``Error/unsupportedMedia`` as `.video(video)`
+    ///   would. Each variant is then embedded like ``embed(_:task:dimensions:)`` and throws
+    ///   the same errors; one failing variant fails the whole call without a partial result.
     public func embed(
         sharingVideo video: UserInput.Video, variants: [Input], task: Task,
         dimensions: Int? = nil
