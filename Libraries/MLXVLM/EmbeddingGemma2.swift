@@ -637,10 +637,12 @@ public actor EmbeddingGemma2Embedding {
     /// soft tokens live for this call only; each variant's other media is evaluated and
     /// released in turn.
     ///
-    /// - Throws: ``Error/emptyInput`` without variants, ``Error/unsupportedMedia`` when
-    ///   the checkpoint cannot embed video, and ``Error/misplacedSharedVideo`` for a
-    ///   variant with two `.sharedVideo` parts. Variants are validated before the video
-    ///   is decoded.
+    /// - Throws: Before any frame is decoded: ``Error/emptyInput`` without variants or for
+    ///   a variant with neither text nor media, ``Error/unsupportedMedia`` when the
+    ///   checkpoint cannot embed video or a variant's own media, ``Error/invalidDimension``,
+    ///   and ``Error/misplacedSharedVideo`` for a variant with two `.sharedVideo` parts.
+    ///   Each variant is then embedded like ``embed(_:task:dimensions:)`` and throws the
+    ///   same errors; one failing variant fails the whole call without a partial result.
     public func embed(
         sharingVideo video: UserInput.Video, variants: [Input], task: Task,
         dimensions: Int? = nil
