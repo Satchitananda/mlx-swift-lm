@@ -490,6 +490,11 @@ public actor EmbeddingGemma2Embedding {
             case video(UserInput.Video)
             /// Mono audio; the first 30 seconds count.
             case audio(UserInput.Audio)
+            /// The video of an `embed(sharingVideo:variants:task:dimensions:)` call, encoded
+            /// once for all of its variants, at this position. Valid only in such a variant
+            /// and at most once per variant; anywhere else it throws
+            /// ``EmbeddingGemma2Embedding/Error/misplacedSharedVideo``.
+            case sharedVideo
         }
 
         public let parts: [Part]
@@ -529,11 +534,16 @@ public actor EmbeddingGemma2Embedding {
         case contextExceeded
         case invalidEmbedding
         case invalidDimension
+        /// A `.sharedVideo` part outside `embed(sharingVideo:variants:task:dimensions:)`,
+        /// or more than one in a variant.
+        case misplacedSharedVideo
 
         public var errorDescription: String? {
             switch self {
             case .emptyInput:
                 "An embedding input must contain text or media."
+            case .misplacedSharedVideo:
+                "A shared-video part is valid only once per variant of a call sharing a video."
             case .unsupportedMedia:
                 "This checkpoint cannot embed this kind of media."
             case .invalidMedia:
@@ -615,25 +625,61 @@ public actor EmbeddingGemma2Embedding {
     public func embed(
         _ input: Input, task: Task, dimensions: Int? = nil
     ) async throws -> [Float] {
+        try await embed(input, task: task, dimensions: dimensions, sharedVideo: nil)
+    }
+
+    /// Embeds variants of one video, running the vision tower over its frames once.
+    ///
+    /// Each variant's `.sharedVideo` part stands for `video`; a variant without one is
+    /// embedded as is. Every other part, the prompting, the token limit, pooling and
+    /// normalization follow ``embed(_:task:dimensions:)`` exactly, so a variant's vector
+    /// equals the one it would get with `.video(video)` in that position. The shared
+    /// soft tokens live for this call only; each variant's other media is evaluated and
+    /// released in turn.
+    ///
+    /// - Throws: Before any frame is decoded: ``Error/emptyInput`` without variants or for
+    ///   a variant with neither text nor media, ``Error/unsupportedMedia`` when the
+    ///   checkpoint cannot embed video or a variant's own media, ``Error/invalidDimension``,
+    ///   and ``Error/misplacedSharedVideo`` for a variant with two `.sharedVideo` parts.
+    ///   The video is then decoded and encoded once, whether or not a variant refers to
+    ///   it, throwing ``Error/invalidMedia`` or ``Error/unsupportedMedia`` as `.video(video)`
+    ///   would. Each variant is then embedded like ``embed(_:task:dimensions:)`` and throws
+    ///   the same errors; one failing variant fails the whole call without a partial result.
+    public func embed(
+        sharingVideo video: UserInput.Video, variants: [Input], task: Task,
+        dimensions: Int? = nil
+    ) async throws -> [[Float]] {
         try Swift.Task.checkCancellation()
-        let dimension = dimensions ?? model.config.embeddingDim
-        guard
-            dimension == model.config.embeddingDim
-                || ([128, 256, 512].contains(dimension) && dimension <= model.config.embeddingDim)
-        else { throw Error.invalidDimension }
-        for part in input.parts {
-            switch part {
-            case .image where !supportedModalities.contains(.image),
-                .video where !supportedModalities.contains(.video),
-                .audio where !supportedModalities.contains(.audio):
-                throw Error.unsupportedMedia
-            default: break
-            }
+        guard !variants.isEmpty else { throw Error.emptyInput }
+        guard supportedModalities.contains(.video) else { throw Error.unsupportedMedia }
+        _ = try dimension(dimensions)
+        for variant in variants {
+            try validate(variant, sharingVideo: true)
         }
-        let hasText = input.parts.contains { !($0.text ?? "").allSatisfy(\.isWhitespace) }
-        guard hasText || input.parts.contains(where: { $0.text == nil }) else {
-            throw Error.emptyInput
+        let shared = try await encode(video)
+        try MLX.checkedEval(shared.features)
+        var vectors: [[Float]] = []
+        vectors.reserveCapacity(variants.count)
+        for variant in variants {
+            try Swift.Task.checkCancellation()
+            vectors.append(
+                try await embed(variant, task: task, dimensions: dimensions, sharedVideo: shared))
         }
+        return vectors
+    }
+
+    /// The soft tokens of one encoded media item and the segment they fill.
+    private typealias Encoded = (segment: EmbeddingGemma2Sequence.Segment, features: MLXArray)
+
+    /// The one implementation behind both public entry points; `sharedVideo` fills the
+    /// input's `.sharedVideo` part.
+    private func embed(
+        _ input: Input, task: Task, dimensions: Int?, sharedVideo: Encoded?
+    ) async throws -> [Float] {
+        try Swift.Task.checkCancellation()
+        let dimension = try dimension(dimensions)
+        try validate(input, sharingVideo: sharedVideo != nil)
+        let hasText = input.hasText
         guard let begin = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }),
             let end = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>")
         else { throw Error.invalidEmbedding }
@@ -651,7 +697,15 @@ public actor EmbeddingGemma2Embedding {
                 segments.append(.text(tokenizer.encode(text: text, addSpecialTokens: false)))
                 text = ""
             }
-            let (segment, features) = try await encode(part)
+            let segment: EmbeddingGemma2Sequence.Segment
+            let features: MLXArray?
+            if case .sharedVideo = part {
+                // `validate` admits the part only when a shared video is present.
+                guard let sharedVideo else { throw Error.misplacedSharedVideo }
+                (segment, features) = sharedVideo
+            } else {
+                (segment, features) = try await encode(part)
+            }
             if let features {
                 try MLX.checkedEval(features)
                 softTokens.append(features.reshaped(-1, features.dim(-1)))
@@ -681,13 +735,43 @@ public actor EmbeddingGemma2Embedding {
         return truncated.map { Float(Double($0) / norm) }
     }
 
+    /// The output size a request asks for: the checkpoint's, or a Matryoshka prefix.
+    private func dimension(_ requested: Int?) throws -> Int {
+        let dimension = requested ?? model.config.embeddingDim
+        guard
+            dimension == model.config.embeddingDim
+                || ([128, 256, 512].contains(dimension) && dimension <= model.config.embeddingDim)
+        else { throw Error.invalidDimension }
+        return dimension
+    }
+
+    /// Rejects an input this checkpoint or call cannot embed, before any media is decoded.
+    private func validate(_ input: Input, sharingVideo: Bool) throws {
+        var sharedVideos = 0
+        for part in input.parts {
+            switch part {
+            case .sharedVideo:
+                sharedVideos += 1
+                guard sharingVideo, sharedVideos == 1 else { throw Error.misplacedSharedVideo }
+            case .image where !supportedModalities.contains(.image),
+                .video where !supportedModalities.contains(.video),
+                .audio where !supportedModalities.contains(.audio):
+                throw Error.unsupportedMedia
+            default: break
+            }
+        }
+        guard input.hasText || input.parts.contains(where: { $0.text == nil }) else {
+            throw Error.emptyInput
+        }
+    }
+
     /// The segment of one media part and the soft tokens that fill it, `nil` when empty.
     private func encode(_ part: Input.Part) async throws -> (
         EmbeddingGemma2Sequence.Segment, MLXArray?
     ) {
         switch part {
-        case .text:
-            preconditionFailure("Text parts have no soft tokens.")
+        case .text, .sharedVideo:
+            preconditionFailure("Only media parts are encoded here.")
         case .image(let image):
             let processor =
                 try imageProcessor ?? EmbeddingGemma2ImageProcessor(directory: modelDirectory)
@@ -702,17 +786,7 @@ public actor EmbeddingGemma2Embedding {
             }
             return (.image(tokens: features.dim(1)), features)
         case .video(let video):
-            let processor =
-                try videoProcessor ?? EmbeddingGemma2VideoProcessor(directory: modelDirectory)
-            videoProcessor = processor
-            let pixels = try await processor.frames(for: video)
-            try Swift.Task.checkCancellation()
-            try await model.loadMediaComponents([.vision])
-            try Swift.Task.checkCancellation()
-            guard let features = try model.imageFeatures(pixels) else {
-                throw Error.unsupportedMedia
-            }
-            return (.video(frames: features.dim(0), tokensPerFrame: features.dim(1)), features)
+            return try await encode(video)
         case .audio(let audio):
             let processor =
                 try audioProcessor ?? EmbeddingGemma2AudioProcessor(directory: modelDirectory)
@@ -728,6 +802,21 @@ public actor EmbeddingGemma2Embedding {
             }
             return (.audio(tokens: features.dim(1)), features)
         }
+    }
+
+    /// The video segment and the still unevaluated soft tokens of its sampled frames.
+    private func encode(_ video: UserInput.Video) async throws -> Encoded {
+        let processor =
+            try videoProcessor ?? EmbeddingGemma2VideoProcessor(directory: modelDirectory)
+        videoProcessor = processor
+        let pixels = try await processor.frames(for: video)
+        try Swift.Task.checkCancellation()
+        try await model.loadMediaComponents([.vision])
+        try Swift.Task.checkCancellation()
+        guard let features = try model.imageFeatures(pixels) else {
+            throw Error.unsupportedMedia
+        }
+        return (.video(frames: features.dim(0), tokensPerFrame: features.dim(1)), features)
     }
 
     /// The parts with the task's instruction prefix joined to the leading text.
@@ -768,6 +857,13 @@ public actor EmbeddingGemma2Embedding {
             }
             return "title: none | text: \(text)"
         }
+    }
+}
+
+extension EmbeddingGemma2Embedding.Input {
+    /// True when some text part has a non-whitespace character.
+    fileprivate var hasText: Bool {
+        parts.contains { !($0.text ?? "").allSatisfy(\.isWhitespace) }
     }
 }
 

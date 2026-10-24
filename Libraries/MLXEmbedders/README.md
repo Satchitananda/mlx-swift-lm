@@ -200,3 +200,24 @@ frame cap. Audio is mono at 16 kHz and keeps the first 30 seconds. Text truncati
 preserves complete media blocks; media that exceeds the shared 8,192-token budget
 throws `contextExceeded`. Float16 checkpoint tensors are promoted to float32
 before inference; bfloat16 and float32 checkpoints retain their precision.
+
+To embed several variants of one video without decoding and encoding its frames for
+each, pass the video once and mark its position in each variant with `.sharedVideo`:
+
+```swift
+let vectors = try await embeddings.embed(
+    sharingVideo: .url(movie),
+    variants: [
+        .init([.sharedVideo]),
+        .init([.sharedVideo, .audio(.url(narration))]),
+        .init([.text("Aurora over Tromsø: "), .sharedVideo], title: "Night sky"),
+    ],
+    task: .document)
+```
+
+Each variant's vector equals the one `embed(_:task:dimensions:)` returns with
+`.video` in that position; a variant without the part is embedded as is. `.sharedVideo`
+is valid only in such a variant and at most once per variant; anywhere else the call
+throws `misplacedSharedVideo`. Variants are validated before any frame is decoded, then
+embedded one at a time, and one failing variant fails the whole call without a partial
+result.
