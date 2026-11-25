@@ -5,8 +5,8 @@ import Testing
 
 @testable import MLXGuidedGeneration
 
-/// `GrammarConstraint.freshMatcher()` reuses a compiled grammar and does not
-/// need `GrammarMatcher::Fork()`, so these run on the vendored xgrammar.
+/// `GrammarConstraint.freshMatcher()` reuses a compiled grammar without
+/// `GrammarMatcher::Fork()` and always starts at the grammar's initial state.
 @Suite
 struct FreshMatcherTests {
 

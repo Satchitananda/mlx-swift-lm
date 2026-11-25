@@ -8,6 +8,7 @@
 #define XGRAMMAR_GRAMMAR_H_
 
 #include <xgrammar/object.h>
+#include <xgrammar/tokenizer_info.h>
 
 #include <optional>
 #include <stdexcept>
@@ -117,7 +118,8 @@ class Grammar {
       std::optional<std::pair<std::string, std::string>> separators = std::nullopt,
       bool strict_mode = true,
       std::optional<int> max_whitespace_cnt = std::nullopt,
-      bool print_converted_ebnf = false
+      bool print_converted_ebnf = false,
+      bool any_order = false
   );
 
   /*!
@@ -131,9 +133,11 @@ class Grammar {
   /*!
    * \brief Construct a grammar from a structural tag string.
    * \param structural_tag_json The structural tag string.
+   * \param tokenizer_info Optional tokenizer info for resolving string token references.
    */
   static std::variant<Grammar, StructuralTagError> FromStructuralTag(
-      const std::string& structural_tag_json
+      const std::string& structural_tag_json,
+      const std::optional<TokenizerInfo>& tokenizer_info = std::nullopt
   );
 
   /*!

@@ -30,6 +30,7 @@ upstream. The last fork commit carrying DFlash2 is tagged `fork/dflash2-last-202
 | Upstream `.github` changes (issue templates, ci-state scripts and workflows) | Deferred. The fork's `.github` is unchanged. |
 | MLXGuidedGeneration multi-stop `GrammarTokenizer` (`2e5f75a`, plan M4) | **New, upstreamable.** `GrammarTokenizer.init(vocab:vocabType:stopTokenIds:)` registers every stop id with XGrammar and validates the set (non-empty, in range, unique; `GrammarTokenizerError`). The single-EOS init delegates to it. `GuidedGenerationLoop.run` unions the registered ids into its stop set and throws `prematureEOS` for an unregistered stop sampled before the grammar can terminate (it used to return truncated output as success). Tests: `MultiStopGrammarTokenizerTests`. Upstream branch `guided/multi-stop-grammar-tokenizer`; drop this patch once upstream merges it. |
 | MLXGuidedGeneration `JSONSchemaFormat` (`479850a`, plan M4) | **New, upstreamable.** `GrammarConstraint(tokenizer:jsonSchema:format:)` takes `anyWhitespace` / `indent` / `separators` / `strictMode`, passed to XGrammar's `CompileJSONSchema` through the new shim entry point `xg_compile_json_schema_with_format`. The default equals the previous grammar, and `.compact` is single-line JSON with no whitespace. Tests: `JSONSchemaFormatTests`, `CXGrammarTests/JSONSchemaFormatShimTests`. Upstream branch `guided/json-schema-format-options`; drop this patch once upstream merges it. |
+| Vendored XGrammar 0.2.3 (plan D11) | **New, upstreamable.** `Libraries/MLXCXGrammar/xgrammar/` re-vendored from v0.1.30 to v0.2.3 (`557becfb`) with `scripts/sync-xgrammar-source.sh`. Reason: the catalog kit's golden grammar corpus (640 cases recorded against MLXStructured's XGrammar 0.2.3) differed in 2 cases, both from 0.1.30's float-range regex (`GenerateFloatRangeRegex`): under `"minimum": 0` every value in (0, 1) was rejected, and a bounded `"maximum"` admitted fractions past it. Shim: `kXGrammarVersion` = `v0.2.3`, and `xg_matcher_fork` now calls `GrammarMatcher::Fork()`, so `GrammarConstraint.clone()` works and `ModelCache` reuses compiled templates. Every other shim call compiles unchanged (0.2.3 only adds trailing defaulted parameters). `grammar_functor_wrapper.cc` and its `exclude` are gone: 0.2.3 declares the three `GrammarFSMHasherImpl` flags `static constexpr`. Tests: new `JSONSchemaNumberRangeTests` (default and `.compact` formats); on 0.1.30 it fails with 10 issues (`0.5`, `0.05`, `0.0` rejected under `minimum: 0`; `30.5`, `30.01` accepted under `maximum: 30`, in both formats), on 0.2.3 it passes. `ConstraintCachingTests` re-enabled, plus two clone cases (`clonedConstraintCarriesTheMatcherState`, `clonedConstraintOutlivesItsSource`). `VersionTests` expects `v0.2.3`. Upstream branch `guided/xgrammar-0.2.3` (its number-range test has the default format only, since `JSONSchemaFormat` is a separate upstream branch); drop this patch once upstream merges it. |
 | `IntegrationTesting/` | Takes upstream's files, plus the fork's `Gemma4UnifiedAudioIntegrationTests.swift`. The 2026-10-23 merge had kept stale pre-merge versions of the upstream integration tests, which no longer compiled against the library (for example a missing `.rejectedToolCall` case and synchronous `loadWeights`). The six upstream test files that merge had dropped are restored. |
 
 ## Conflicts by area
@@ -97,6 +98,13 @@ add no warnings; the remaining warnings are upstream deprecations in tests.
 
 The 2 known issues are upstream's own `withKnownIssue` in the MiniCPM5 CDATA tool-call test.
 The skips are checkpoint- and environment-gated tests.
+
+XGrammar 0.2.3 bump (D11), after `swift build --build-tests -Xswiftc -strict-concurrency=complete`
+with the metallib re-staged: `--filter 'MLXGuidedGenerationTests|CXGrammarTests'` passes 102 tests
+in 20 suites and 10 tests in 6 suites. The full suite under default TF32 passes: MLXLMTests
+1,073 executed, 9 skipped, 0 failures; MLXHuggingFaceMacrosTests 9; Swift Testing 1,600 / 131
+(2 known issues), 102 / 20, 195 / 28, 10 / 6, all passed. The `MLX_ENABLE_TF32=0` regime was not
+rerun for the bump: it changes only the grammar target and its tests, which use no matmuls.
 
 Gemma 4 audio-only suites
 (`--filter 'Gemma4UnifiedAudioTests|Gemma4AudioFeatureStreamTests|Gemma4AudioTests|UserInputAudioTests'`):
