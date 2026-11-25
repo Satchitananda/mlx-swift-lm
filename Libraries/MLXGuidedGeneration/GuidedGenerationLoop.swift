@@ -88,8 +88,11 @@ public enum GuidedGenerationLoop {
     /// - Returns: Total number of tokens generated (including FF tokens).
     /// - Throws: `GuidedGenerationError.incompleteOutput` if maxTokens is
     ///   exhausted before the grammar reaches a stop state.
-    ///   `GuidedGenerationError.prematureEOS` if the model emits EOS
-    ///   before the grammar accepts.
+    ///   `GuidedGenerationError.prematureEOS` if the model emits a stop
+    ///   token that the grammar tokenizer does not register (or the
+    ///   unknown token) before the grammar can terminate. Registered stop
+    ///   tokens are masked until then, so register every stop token with
+    ///   `GrammarTokenizer(vocab:vocabType:stopTokenIds:)`.
     @discardableResult
     public static func run(
         input: LMInput,
@@ -128,11 +131,14 @@ public enum GuidedGenerationLoop {
         processor?.prompt(input.text.tokens)
         defer { processor?.finalizeGeneration() }
 
-        // Build EOS token set
+        // Build the stop set: the configuration's and tokenizer's stop
+        // tokens plus every stop token the grammar tokenizer registers. The
+        // grammar masks only the registered ones until it can terminate.
+        let registeredStopTokenIDs = Set(constraint.stopTokenIds.map(Int.init))
         let stopTokenIDs = Self.buildStopTokenIDs(
             tokenizer: context.tokenizer,
             configuration: context.configuration
-        )
+        ).union(registeredStopTokenIDs)
 
         // Prefill prompt and get first set of logits
         var logits: MLXArray
@@ -317,17 +323,28 @@ public enum GuidedGenerationLoop {
             // model's raw logits might have EOS as the highest value
             // even though the grammar has NOT accepted the output.
             //
-            // When `needsApply` IS true: if the grammar mask allowed
-            // EOS (bit = 1), the grammar considers the output
-            // acceptable. If the mask did NOT allow EOS,
-            // `applyMaskAndSample` set it to -inf, so the sampler could not
-            // have selected it.
+            // When `needsApply` IS true: a stop token registered with the
+            // grammar tokenizer is in the mask only when the grammar can
+            // terminate, so sampling it ends the output acceptably. Any
+            // other stop id (one the grammar tokenizer does not register,
+            // or the unknown token) is ordinary text to the grammar and
+            // can be allowed inside an unfinished value. It ends the output
+            // acceptably only where a registered stop is also allowed;
+            // anywhere else the output is incomplete.
             if mask.needsApply {
                 if tokenId == context.tokenizer.unknownTokenId || stopTokenIDs.contains(tokenId) {
                     if diagnosticLog {
                         logger.info(
                             "[GuidedGen] Stop reason: EOS/unk tokenId=\(tokenId) at token \(tokenCount)"
                         )
+                    }
+                    let grammarCanTerminate =
+                        registeredStopTokenIDs.contains(tokenId)
+                        || registeredStopTokenIDs.contains {
+                            maskAllows(mask, tokenId: $0, vocabSize: vocabSize)
+                        }
+                    guard grammarCanTerminate else {
+                        throw GuidedGenerationError.prematureEOS
                     }
                     grammarStopped = true
                     break
@@ -526,6 +543,10 @@ public enum GuidedGenerationLoop {
     ///    some Gemma variants in `LLMModelFactory`). Callers needing extra
     ///    stop tokens add them here (via the model configuration), not as a
     ///    per-call argument.
+    ///
+    /// `run` adds the stop tokens registered on the constraint's
+    /// `GrammarTokenizer`. Register the same ids there (all three sources)
+    /// so the grammar masks every stop token until it can terminate.
     static func buildStopTokenIDs(
         tokenizer: any Tokenizer,
         configuration: ModelConfiguration
