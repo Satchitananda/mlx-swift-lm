@@ -53,6 +53,19 @@ public enum GrammarError: Error {
 
 // MARK: - GrammarTokenizer
 
+/// Errors from validating the stop-token set passed to `GrammarTokenizer`.
+public enum GrammarTokenizerError: Error, Equatable, Sendable {
+    /// No stop token was given. A grammar can only terminate by accepting
+    /// a stop token, so at least one is required.
+    case emptyStopTokenIds
+    /// A stop token id is outside the vocabulary (`0 ..< vocabSize`).
+    /// xgrammar ignores such ids, so the grammar could not terminate on
+    /// them.
+    case stopTokenIdOutOfRange(Int32, vocabSize: Int)
+    /// A stop token id appears more than once.
+    case duplicateStopTokenId(Int32)
+}
+
 /// Swift wrapper around `XGTokenizerInfo*`. Manages C pointer lifetime
 /// via `deinit`.
 ///
@@ -66,6 +79,26 @@ public enum GrammarError: Error {
 public final class GrammarTokenizer: @unchecked Sendable {
     let pointer: OpaquePointer
     public let vocabSize: Int
+    /// The token ids registered with xgrammar as stop tokens, in the order
+    /// given. A grammar masks every one of them until it can terminate, and
+    /// none of them ever matches grammar text.
+    public let stopTokenIds: [Int32]
+
+    /// Construct a tokenizer from a pre-decoded vocab with one stop token.
+    ///
+    /// Equivalent to `init(vocab:vocabType:stopTokenIds: [eosTokenId])`.
+    /// Models that end a turn with more than one token (for example
+    /// `<eos>` and `<end_of_turn>`) should register all of them with
+    /// `init(vocab:vocabType:stopTokenIds:)`: a stop token that is not
+    /// registered is ordinary text to the grammar, so it stays allowed
+    /// inside an unfinished value.
+    ///
+    /// - Throws: `GrammarTokenizerError.stopTokenIdOutOfRange` if
+    ///   `eosTokenId` is outside the vocabulary, or
+    ///   `GrammarError.tokenizerCreationFailed`.
+    public convenience init(vocab: [String], vocabType: VocabType, eosTokenId: Int32) throws {
+        try self.init(vocab: vocab, vocabType: vocabType, stopTokenIds: [eosTokenId])
+    }
 
     /// Construct a tokenizer from a pre-decoded vocab.
     ///
@@ -78,16 +111,34 @@ public final class GrammarTokenizer: @unchecked Sendable {
     ///     `.byteFallback` applies SentencePiece `<0xNN>` + `▁`
     ///     decoding; `.byteLevel` applies GPT-2 `bytes_to_unicode`
     ///     decoding.
-    ///   - eosTokenId: End-of-sequence token ID, registered as a stop
-    ///     token on the xgrammar TokenizerInfo.
-    public init(vocab: [String], vocabType: VocabType, eosTokenId: Int32) throws {
+    ///   - stopTokenIds: Every token id that ends generation, such as
+    ///     the tokenizer's EOS plus the model's end-of-turn tokens. Each
+    ///     is registered as a stop token on the xgrammar TokenizerInfo,
+    ///     so the grammar masks all of them until it can terminate.
+    ///     Must be non-empty, unique, and inside `0 ..< vocab.count`.
+    /// - Throws: `GrammarTokenizerError` for an invalid stop set, or
+    ///   `GrammarError.tokenizerCreationFailed`.
+    public init(vocab: [String], vocabType: VocabType, stopTokenIds: [Int32]) throws {
+        guard !stopTokenIds.isEmpty else {
+            throw GrammarTokenizerError.emptyStopTokenIds
+        }
+        var seen = Set<Int32>()
+        for id in stopTokenIds {
+            guard id >= 0, Int(id) < vocab.count else {
+                throw GrammarTokenizerError.stopTokenIdOutOfRange(id, vocabSize: vocab.count)
+            }
+            guard seen.insert(id).inserted else {
+                throw GrammarTokenizerError.duplicateStopTokenId(id)
+            }
+        }
+
         self.vocabSize = vocab.count
+        self.stopTokenIds = stopTokenIds
 
         var info: OpaquePointer?
-        let stopTokens: [Int32] = [eosTokenId]
 
         let status: XGStatus = vocab.withCStringPointers { ptrs in
-            stopTokens.withUnsafeBufferPointer { stopBuf in
+            stopTokenIds.withUnsafeBufferPointer { stopBuf in
                 xg_tokenizer_info_new(
                     ptrs.baseAddress,
                     ptrs.count,
@@ -752,6 +803,10 @@ public final class GrammarConstraint: @unchecked Sendable {
         }
         return GrammarConstraint(fromFork: matcherHandle, parent: forkParent ?? self)
     }
+
+    /// The stop token ids registered on this constraint's tokenizer. The
+    /// mask allows any of them only when the grammar can terminate.
+    public var stopTokenIds: [Int32] { tokenizer.stopTokenIds }
 
     /// Query termination while already holding `lock`. Named `Locked`
     /// as the convention for "caller must hold the lock"; this avoids

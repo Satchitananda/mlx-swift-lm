@@ -65,11 +65,14 @@ let output = try await container.perform { context in
     // 1. Extract the vocab in the shape XGrammar expects.
     let grammarVocab = TokenizerVocabExtractor.extractForGrammar(from: tokenizer)
 
-    // 2. Build a grammar tokenizer.
+    // 2. Build a grammar tokenizer. Register every token that ends a turn
+    //    (here EOS plus the configuration's EOS ids) so the grammar masks
+    //    all of them until the output is complete.
+    let stopTokenIds = context.configuration.eosTokenIds.union([tokenizer.eosTokenId ?? 0])
     let grammarTokenizer = try GrammarTokenizer(
         vocab: grammarVocab.vocab,
         vocabType: grammarVocab.vocabType,
-        eosTokenId: Int32(tokenizer.eosTokenId ?? 0))
+        stopTokenIds: stopTokenIds.sorted().map(Int32.init))
 
     // 3. Compile a JSON Schema into a constraint.
     let schema = #"{"type":"object","properties":{"name":{"type":"string"},"knownFor":{"type":"string"}}}"#
