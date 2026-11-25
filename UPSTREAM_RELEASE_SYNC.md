@@ -28,6 +28,8 @@ upstream. The last fork commit carrying DFlash2 is tagged `fork/dflash2-last-202
 | `CompiledTrace` plain closure and the `testPlainCompileFreezesCapturedWeights` hazard test | Upstream adopted the same plain-closure `CompiledTrace` and moved the capture hazard test into mlx-swift (`TransformTests.testCompileCapturesModuleParameterWithoutState`). Both files now equal upstream. |
 | `UserInput.Audio` big-endian pin, `imagesThenVideosThenAudiosThenText` message layout | Retained. |
 | Upstream `.github` changes (issue templates, ci-state scripts and workflows) | Deferred. The fork's `.github` is unchanged. |
+| MLXGuidedGeneration multi-stop `GrammarTokenizer` (`2e5f75a`, plan M4) | **New, upstreamable.** `GrammarTokenizer.init(vocab:vocabType:stopTokenIds:)` registers every stop id with XGrammar and validates the set (non-empty, in range, unique; `GrammarTokenizerError`). The single-EOS init delegates to it. `GuidedGenerationLoop.run` unions the registered ids into its stop set and throws `prematureEOS` for an unregistered stop sampled before the grammar can terminate (it used to return truncated output as success). Tests: `MultiStopGrammarTokenizerTests`. Upstream branch `guided/multi-stop-grammar-tokenizer`; drop this patch once upstream merges it. |
+| MLXGuidedGeneration `JSONSchemaFormat` (`479850a`, plan M4) | **New, upstreamable.** `GrammarConstraint(tokenizer:jsonSchema:format:)` takes `anyWhitespace` / `indent` / `separators` / `strictMode`, passed to XGrammar's `CompileJSONSchema` through the new shim entry point `xg_compile_json_schema_with_format`. The default equals the previous grammar, and `.compact` is single-line JSON with no whitespace. Tests: `JSONSchemaFormatTests`, `CXGrammarTests/JSONSchemaFormatShimTests`. Upstream branch `guided/json-schema-format-options`; drop this patch once upstream merges it. |
 | `IntegrationTesting/` | Takes upstream's files, plus the fork's `Gemma4UnifiedAudioIntegrationTests.swift`. The 2026-10-23 merge had kept stale pre-merge versions of the upstream integration tests, which no longer compiled against the library (for example a missing `.rejectedToolCall` case and synchronous `loadWeights`). The six upstream test files that merge had dropped are restored. |
 
 ## Conflicts by area
@@ -60,6 +62,11 @@ Removed:
 - `DFlash2DrafterModel`, `DFlash2DrafterModelFactory` / registry types, `DFlash2SpeculativeTokenIterator`, `DFlash2TargetModel` (and the `dflash2*` members on `Qwen35TextModel` / `Qwen35Model`), DFlash2 verify request/result types, `DFlash2Registration`.
 - `generate(input:cache:parameters:context:dflash2Drafter:blockSize:components:wiredMemoryTicket:)` and the matching `generateTokens`.
 - The kit used none of these.
+
+Added (fork-only until upstream merges the two MLXGuidedGeneration patches):
+- `GrammarTokenizer.init(vocab:vocabType:stopTokenIds:)`, `GrammarTokenizer.stopTokenIds`, `GrammarConstraint.stopTokenIds`, `GrammarTokenizerError`.
+- `JSONSchemaFormat` (with `Separators`, `.default`, `.compact`) and the `format:` parameter of `GrammarConstraint.init(tokenizer:jsonSchema:format:fastForward:hostTokenizer:)`.
+- Structured's `JSONSchemaFormatOptions` map 1:1: `(strict: true, whitespace: .none)` → `.compact`; `JSONSchemaFormatOptions()` → `.default`; `(strict: true, whitespace: .indent(2))` → `JSONSchemaFormat(anyWhitespace: false, indent: 2)`.
 
 Changed:
 - `ModelContext.init(configuration:model:processor:tokenizer:generationConfig:)` loses `generationConfig:`. `ModelContext.generationConfig` is now computed over `configuration.generationConfig`, so a registry-supplied config wins over the file.
