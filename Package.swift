@@ -226,12 +226,6 @@ let package = Package(
         .target(
             name: "MLXCXGrammar",
             path: "Libraries/MLXCXGrammar",
-            exclude: [
-                // Compiled via Libraries/MLXCXGrammar/grammar_functor_wrapper.cc to
-                // provide out-of-class definitions for static const members that
-                // clang ODR-uses through variadic templates.
-                "xgrammar/cpp/grammar_functor.cc"
-            ],
             publicHeadersPath: "include",
             cxxSettings: [
                 .headerSearchPath("xgrammar/include"),
