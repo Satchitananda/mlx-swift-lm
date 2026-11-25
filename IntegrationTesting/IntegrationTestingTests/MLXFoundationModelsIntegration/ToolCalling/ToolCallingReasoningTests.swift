@@ -24,15 +24,18 @@ private struct WeatherArgs {
 /// Device-only (requires a device running iOS 27.0+): loads real models. v1 family scope is
 /// Qwen3/QwQ (template renders tools AND honors `enable_thinking`); R1-Distill is
 /// de-scoped (tool-blind template) and stays on its single-phase behavior.
-@Suite(.serialized, .timeLimit(.minutes(15)))
-struct ToolCallingReasoningTests {
+extension ModelLoadingSuite {
+    @Suite(.serialized, .timeLimit(.minutes(15))) struct ToolCallingReasoningTests {}
+}
+
+extension ModelLoadingSuite.ToolCallingReasoningTests {
 
     @Test("Setup: release GPU state from prior suites")
     func clearGPUBeforeToolCallingReasoning() async {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
-        let before = GPU.snapshot()
+        let before = Memory.snapshot()
         await releaseAllGPUMemory()
-        let after = GPU.snapshot()
+        let after = Memory.snapshot()
         let freed = (before.activeMemory - after.activeMemory) / (1024 * 1024)
         let cache = before.cacheMemory / (1024 * 1024)
         print("[ToolCallingReasoningSetup] freed \(freed)MB active, \(cache)MB cache")

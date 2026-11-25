@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
+import MLX
 
 /// Parameters controlling how a prompt is prefilled into the ``KVCache``.
 ///
@@ -125,9 +126,12 @@ public struct PrefillParameters: Sendable {
     /// range. The driver owns the loop's shared obligations: cooperative
     /// cancellation between chunks (a long prompt must be interruptible — see
     /// the note in `LLMModel.prepare`), an autorelease pool per chunk (long
-    /// prompts run hundreds of forwards before any autorelease boundary), and
-    /// the per-chunk ``progress`` report. `body` performs the model's forward
-    /// and its own cache fencing (`asyncEval`/`eval`).
+    /// prompts run hundreds of forwards before any autorelease boundary), the
+    /// per-chunk ``progress`` report, and clearing the MLX buffer cache after
+    /// each chunk, as mlx-lm does. The KV cache grows with every chunk, so the
+    /// buffers it outgrows cannot be reused and would otherwise stay in the
+    /// buffer cache. `body` performs the model's forward and its own cache
+    /// fencing (`asyncEval`/`eval`).
     ///
     /// `reserving` positions are left unprocessed for the caller's final
     /// forward — the one that produces logits (1 for every current caller).
@@ -156,8 +160,24 @@ public struct PrefillParameters: Sendable {
                 body(processed ..< processed + n)
                 processed += n
                 progress?(processed, total)
+                Memory.clearCache()
             }
         }
         return processed
+    }
+}
+
+extension PrefillParameters {
+    /// These parameters for one pass of a prefill split in two, so the passes report as one.
+    ///
+    /// `offset` positions precede the pass in a prefill of `total`. The caller reports
+    /// ``prefix`` once, before the first pass, so the pass reports none.
+    package func pass(after offset: Int, of total: Int) -> PrefillParameters {
+        var pass = self
+        pass.prefix = nil
+        if let progress {
+            pass.progress = { processed, _ in progress(offset + processed, total) }
+        }
+        return pass
     }
 }

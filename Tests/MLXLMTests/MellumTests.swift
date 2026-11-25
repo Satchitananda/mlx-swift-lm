@@ -131,10 +131,9 @@ final class MellumTests: XCTestCase {
         let incremental = concatenated([prefill] + steps, axis: 1)
 
         XCTAssertEqual(cache.map(\.offset), [8, 8, 8])
-        // TF32 matmuls leave ~4e-3 between the incremental and full logits; see MatmulPrecision.
-        let tolerance: Double = MatmulPrecision.tolerance(float32: 1e-4, reduced: 2e-2)
-        XCTAssertTrue(
-            allClose(incremental, full, rtol: tolerance, atol: tolerance).item(Bool.self))
+        assertClose(
+            incremental, full, rtol: 1e-4, atol: 1e-4, reducedAtol: 2e-2,
+            "incremental decode diverged from the full forward")
     }
 
     func testQuantizedKVCacheOnFullAttention() throws {
