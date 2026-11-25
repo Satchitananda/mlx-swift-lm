@@ -322,6 +322,45 @@ XGStatus xg_compile_json_schema(
     );
 }
 
+XGStatus xg_compile_json_schema_with_format(
+    XGGrammarCompiler *compiler,
+    const char *schema_json,
+    const XGJSONSchemaFormat *format,
+    XGCompiledGrammar **out_compiled
+) {
+    if (compiler == nullptr) return XG_ERR_INTERNAL;
+    if (format == nullptr) {
+        return xg_compile_json_schema(compiler, schema_json, out_compiled);
+    }
+    if ((format->item_separator == nullptr) != (format->key_separator == nullptr)) {
+        return XG_ERR_INVALID_ARG;
+    }
+
+    const bool any_whitespace = format->any_whitespace != 0;
+    const bool strict_mode = format->strict_mode != 0;
+    std::optional<int> indent = std::nullopt;
+    if (format->indent >= 0) {
+        indent = format->indent;
+    }
+    std::optional<std::pair<std::string, std::string>> separators = std::nullopt;
+    if (format->item_separator != nullptr) {
+        separators = std::make_pair(
+            std::string(format->item_separator), std::string(format->key_separator)
+        );
+    }
+
+    return CompileSchemaInto(
+        schema_json,
+        out_compiled,
+        XG_ERR_INVALID_JSON_SCHEMA,
+        [&](const std::string &s) {
+            return compiler->inner.CompileJSONSchema(
+                s, any_whitespace, indent, separators, strict_mode
+            );
+        }
+    );
+}
+
 void xg_compiled_grammar_free(XGCompiledGrammar *compiled) {
     if (compiled == nullptr) return;
     delete compiled;
