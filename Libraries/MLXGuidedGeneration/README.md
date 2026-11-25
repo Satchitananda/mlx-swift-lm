@@ -111,6 +111,20 @@ print(output)  // valid JSON matching `schema`
 > `GrammarConstraint` from a background task before the user-visible request
 > removes the blocking window entirely.
 
+### JSON formatting
+
+`GrammarConstraint(tokenizer:jsonSchema:format:)` takes a `JSONSchemaFormat`,
+whose fields map onto XGrammar's `CompileJSONSchema` parameters. The default
+(any whitespace, strict mode) is XGrammar's own. For single-line JSON with no
+whitespace use `.compact`; for pretty-printed output use
+`JSONSchemaFormat(anyWhitespace: false, indent: 2)`. Set `strictMode: false` to
+allow properties and items the schema does not declare.
+
+```swift
+let constraint = try GrammarConstraint(
+    tokenizer: grammarTokenizer, jsonSchema: schema, format: .compact)
+```
+
 ## Why it is bundled this way
 
 The engine is backed by [XGrammar](https://github.com/mlc-ai/xgrammar), which we vendor in-repo and compile here rather than depend on the official XGrammar Swift package. Compiling it ourselves lets us rename its C++ namespace so our copy cannot collide with any other XGrammar linked into the same binary. Anyone else who depends on XGrammar can link their own copy alongside ours, each working independently.

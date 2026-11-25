@@ -290,6 +290,9 @@ public final class GrammarConstraint: @unchecked Sendable {
     ///   - tokenizer: The tokenizer the grammar binds to. Must outlive
     ///     this constraint; a Swift reference is retained here.
     ///   - jsonSchema: A standard JSON Schema source string.
+    ///   - format: Output formatting and strictness. Defaults to
+    ///     `JSONSchemaFormat.default` (XGrammar's defaults: any
+    ///     whitespace, strict mode).
     ///   - fastForward: When `true`, `commitToken` emits the tokens
     ///     produced by xgrammar's `FindJumpForwardString` on every
     ///     successful commit (requires `hostTokenizer`). Defaults to
@@ -302,9 +305,11 @@ public final class GrammarConstraint: @unchecked Sendable {
     public init(
         tokenizer: GrammarTokenizer,
         jsonSchema: String,
+        format: JSONSchemaFormat = .default,
         fastForward: Bool = false,
         hostTokenizer: (any Tokenizer)? = nil
     ) throws {
+        try Self.validate(format)
         self.tokenizer = tokenizer
         self.vocabSize = Int32(tokenizer.vocabSize)
         let words = Int(xg_bitmask_size(self.vocabSize))
@@ -323,12 +328,24 @@ public final class GrammarConstraint: @unchecked Sendable {
 
         var compiledPtr: OpaquePointer?
         let compileStatus = jsonSchema.withCString { schemaPtr in
-            xg_compile_json_schema(compilerHandle, schemaPtr, &compiledPtr)
+            Self.withOptionalCString(format.separators?.item) { itemPtr in
+                Self.withOptionalCString(format.separators?.key) { keyPtr in
+                    var cFormat = XGJSONSchemaFormat(
+                        any_whitespace: format.anyWhitespace ? 1 : 0,
+                        indent: Int32(format.indent ?? -1),
+                        item_separator: itemPtr,
+                        key_separator: keyPtr,
+                        strict_mode: format.strictMode ? 1 : 0
+                    )
+                    return xg_compile_json_schema_with_format(
+                        compilerHandle, schemaPtr, &cFormat, &compiledPtr)
+                }
+            }
         }
         guard compileStatus == XG_OK, let compiledHandle = compiledPtr else {
             xg_grammar_compiler_free(compilerHandle)
             let message = Self.captureShimError(
-                status: compileStatus, fallback: "xg_compile_json_schema"
+                status: compileStatus, fallback: "xg_compile_json_schema_with_format"
             )
             // Discriminate user-schema errors from generic compile
             // failures. xgrammar's typed exceptions map 1:1 to
@@ -815,6 +832,29 @@ public final class GrammarConstraint: @unchecked Sendable {
         var result: Int32 = 0
         let status = xg_matcher_is_terminated(matcher, &result)
         return status == XG_OK && result != 0
+    }
+
+    /// Reject format values XGrammar cannot take: a negative or oversized
+    /// indent, or a separator with an embedded NUL (the shim passes C
+    /// strings).
+    private static func validate(_ format: JSONSchemaFormat) throws {
+        if let indent = format.indent, indent < 0 || indent > Int(Int32.max) {
+            throw GrammarError.constraintCompilationFailed(
+                "JSONSchemaFormat.indent must be between 0 and \(Int32.max), got \(indent)")
+        }
+        if let separators = format.separators,
+            separators.item.utf8.contains(0) || separators.key.utf8.contains(0)
+        {
+            throw GrammarError.constraintCompilationFailed(
+                "JSONSchemaFormat.separators must not contain NUL")
+        }
+    }
+
+    private static func withOptionalCString<R>(
+        _ string: String?, _ body: (UnsafePointer<CChar>?) -> R
+    ) -> R {
+        guard let string else { return body(nil) }
+        return string.withCString { body($0) }
     }
 
     /// Compose a human-readable error detail for shim failures.
