@@ -44,7 +44,7 @@ upstream. The last fork commit carrying DFlash2 is tagged `fork/dflash2-last-202
 - EmbeddingGemma 2: `EmbeddingGemma2.swift` is upstream's plus the sharing path, and `MultimodalEmbedding.swift` gains `.sharedVideo`. `Libraries/MLXEmbedders/README.md` keeps both sections.
 - Compile: `CompiledTrace.swift` and `CompiledTraceTests.swift` are upstream's.
 - Tests: `EmbeddingGemma2Tests`, `Gemma3nSharedKVTests`, `MellumTests` and `VLMTextOnlyContinuationTests` take upstream's #802 tolerance calls. Fork-only tests are kept.
-- Semantic, without a conflict: `StopStringTests` handles the new `Generation.reasoning` case.
+- Semantic, without a conflict: `StopStringTests` handles the new `Generation.reasoning` and `.steering` cases.
 
 Gemma 4 early-return audit: in `Libraries/MLXVLM/Models/Gemma4*.swift`, both processors' fast
 paths include audio (`if input.images.isEmpty, input.videos.isEmpty, input.audios.isEmpty` and
@@ -68,16 +68,52 @@ Changed:
 - `EmbeddingInput.Part` gains `.sharedVideo`, so exhaustive switches over it must handle it.
 - `embed(_:[Input],task:dimensions:)` now batches text-only inputs (≤1,024 tokens per batch). `init` reads the tokenizer from the resolved `tokenizerDirectory`.
 - `generateTask(...)` gains a trailing `reasoningPrimedInside:` argument.
-- `Generation` gains `.reasoning(String)` (#563). With a resolved `ModelConfiguration.reasoningConfig` (Gemma 4 channels), thought text now arrives as `.reasoning` instead of `.chunk`. The kit's own reasoning split and `default: break` switches must be checked.
+- `Generation` gains `.reasoning(String)` (#563) and `.steering(SteeringEvent)` (#608). With a resolved `ModelConfiguration.reasoningConfig` (Gemma 4 channels), thought text now arrives as `.reasoning` instead of `.chunk`. The kit's own reasoning split and `default: break` switches must be checked.
 - Load functions gain `progress: LoadProgressHandlers` (#551); the trailing `progressHandler` overloads remain. `ChatSession` adds steering and interrupts (#608, #798).
 
 ## Validation
 
-TODO (next phase): `swift build --build-tests -Xswiftc -strict-concurrency=complete`, then stage
-`mlx.metallib` into every `*.xctest` bundle and run `swift test --skip-build --no-parallel` under
-the default TF32 setting and again with `MLX_ENABLE_TF32=0`. Also run the Gemma 4 audio-only
-suites (`Gemma4UnifiedAudioTests|Gemma4AudioFeatureStreamTests|Gemma4AudioTests|UserInputAudioTests`)
-explicitly.
+Xcode 27 / Swift 6.4, M5 Max. Sibling mlx-swift worktree `bfc1a363` (core `6a3f90b29` = v0.32.4
+plus #4746 and #4818, mlx-c `a26f2d5`). Its debug `mlx.metallib`, compiled from all 14
+`Source/Cmlx/mlx-generated/metal` sources with MLX's kernel flags, was copied into every
+`*.xctest` bundle. Stale copies were deleted before each `swift build` (CodeSign trap).
+
+`swift build --build-tests -Xswiftc -strict-concurrency=complete` passes. Fork-touched files
+add no warnings; the remaining warnings are upstream deprecations in tests.
+
+`swift test --skip-build --no-parallel` passes in both regimes, with the same totals:
+
+| Regime | XCTest | Swift Testing |
+| --- | --- | --- |
+| default (TF32 on) | MLXLMTests 1,073 executed, 9 skipped, 0 failures; MLXHuggingFaceMacrosTests 6; two further bundles 9 each; 0 failures | 1,600 tests / 131 suites (2 known issues), 82 / 17, 195 / 28, 7 / 5; all passed |
+| `MLX_ENABLE_TF32=0` | identical, 0 failures | identical, all passed |
+
+The 2 known issues are upstream's own `withKnownIssue` in the MiniCPM5 CDATA tool-call test.
+The skips are checkpoint- and environment-gated tests.
+
+Gemma 4 audio-only suites
+(`--filter 'Gemma4UnifiedAudioTests|Gemma4AudioFeatureStreamTests|Gemma4AudioTests|UserInputAudioTests'`):
+38 tests in 4 suites pass.
+
+Changes made during validation:
+
+- `UnreadCheckpointTowersTests.gemma4VLMWithAudioConfigReadsAudio` (new, fork). Upstream #711
+  skips the checkpoint parts that a model lacks. This test checks that the MLXVLM Gemma 4 with
+  an `audio_config` holds `audio_tower.*` / `embed_audio.*` parameters and that the loader reads
+  and loads all of them. Without the fork's audio tower the test fails.
+  - The test's vision config sets `use_clipped_linears: true`. Gemma 4 `sanitize` drops every
+    `input_min/max` and `output_min/max` tensor when the vision config does not use clipped
+    linears, including the audio tower's. This rule is pre-existing (fork main has the same
+    filter) and untouched by this sync. A checkpoint with unclipped vision and clipped audio
+    would fail to load the audio clip bounds; it is worth checking against real E2B/E4B configs.
+- `GatedDeltaTests.testGatedDeltaFastPathKeepsDecayNearOneInFloat32` (upstream #740) failed
+  only under `MLX_ENABLE_TF32=0`: drift 1.44e-3 against an IEEE bound of 1e-3. A probe measured
+  the same 1.4360338e-3 drift in both regimes, so it comes from mlx core's chunked NAX gated-delta
+  kernel (as the test's own comment says), not from TF32 matmuls. A lost decay drifts 1.16e-1.
+  The bound is now a flat 1e-2, independent of `MatmulPrecision`: 7x the measured drift and
+  11x below a lost decay. This could be reported upstream.
+- No other post-#649 tolerance needed adapting. Upstream's #802 `reducedAtol` bounds hold in
+  both regimes on this host.
 
 # Upstream main sync — 2026-10-23
 

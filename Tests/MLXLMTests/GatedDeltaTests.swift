@@ -318,7 +318,10 @@ public class GatedDeltaTests: XCTestCase {
     /// from the custom kernel, which keeps `g` in float32 (ml-explore/mlx#4725).
     ///
     /// On NAX hardware mlx core runs a chunked kernel that drifts more over 256
-    /// steps. A lost decay still drifts far more than that.
+    /// steps. A lost decay still drifts far more than that. The chunked kernel's
+    /// drift does not depend on TF32: on an M5 Max it is 1.4e-3 with and without
+    /// `MLX_ENABLE_TF32=0`, where a lost decay drifts 1.2e-1. So the bound is not
+    /// a `MatmulPrecision` choice: with TF32 off, NAX hardware would fail 1e-3.
     func testGatedDeltaFastPathKeepsDecayNearOneInFloat32() throws {
         let inputs = makeQwen35Inputs(T: 256, decay: 0.999)
 
@@ -331,7 +334,7 @@ public class GatedDeltaTests: XCTestCase {
 
         let drift = relativeDrift(stateFast, stateKernel)
         XCTAssertLessThan(
-            drift, MatmulPrecision.tolerance(float32: 1e-3, reduced: 1e-2),
+            drift, 1e-2,
             "A decay of 0.999 was rounded to 1 before the MLXFast kernel (drift \(drift))."
         )
     }
