@@ -295,6 +295,8 @@ private func runGenerateTask(
             info = completion
         case .reasoning:
             XCTFail("plain response unexpectedly parsed as reasoning")
+        case .steering:
+            XCTFail("no steering was requested")
         case .toolCall, .rejectedToolCall:
             XCTFail("plain response unexpectedly parsed as a tool call")
         }

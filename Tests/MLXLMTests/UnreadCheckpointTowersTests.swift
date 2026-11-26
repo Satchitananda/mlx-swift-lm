@@ -36,6 +36,21 @@ struct UnreadCheckpointTowersTests {
             ["audio_tower.layers.0.weight", "embed_audio.projection.weight"], loading: model)
     }
 
+    /// Fork: the MLXVLM Gemma 4 runs audio when its config declares an `audio_config`, so the
+    /// loader must read and load the audio tower and embedder instead of skipping them.
+    @Test func gemma4VLMWithAudioConfigReadsAudio() throws {
+        let model = MLXVLM.Gemma4(
+            try decode(
+                MLXVLM.Gemma4Configuration.self,
+                #"{"model_type": "gemma4", "text_config": \#(gemma4TextConfigJSON), "#
+                    + #""vision_config": \#(gemma4ClippedVisionConfigJSON), "#
+                    + #""audio_config": \#(gemma4AudioConfigJSON), "audio_token_id": 60}"#))
+        let names = model.parameters().flattened().map(\.0)
+        #expect(names.contains { $0.hasPrefix("audio_tower.") })
+        #expect(names.contains { $0.hasPrefix("embed_audio.") })
+        try expectUnread([], loading: model)
+    }
+
     @Test func qwen35TextModelSkipsVisionAndMTP() throws {
         let model = MLXLLM.Qwen35Model(
             try decode(
@@ -103,6 +118,28 @@ private let gemma4VisionConfigJSON = """
         "num_hidden_layers": 1, "hidden_size": 16, "intermediate_size": 32,
         "num_attention_heads": 2, "head_dim": 8, "patch_size": 4, "default_output_length": 4,
         "pooling_kernel_size": 1, "position_embedding_size": 8
+    }
+    """
+
+/// Gemma 4 `sanitize` keeps clip bounds only when the vision config uses clipped linears,
+/// and the audio tower's clippable linears need them.
+private let gemma4ClippedVisionConfigJSON = """
+    {
+        "num_hidden_layers": 1, "hidden_size": 16, "intermediate_size": 32,
+        "num_attention_heads": 2, "head_dim": 8, "patch_size": 4, "default_output_length": 4,
+        "pooling_kernel_size": 1, "position_embedding_size": 8, "use_clipped_linears": true
+    }
+    """
+
+private let gemma4AudioConfigJSON = """
+    {
+        "model_type": "gemma4_audio", "hidden_size": 64, "num_hidden_layers": 1,
+        "num_attention_heads": 4, "subsampling_conv_channels": [128, 32],
+        "conv_kernel_size": 5, "residual_weight": 0.5, "attention_chunk_size": 12,
+        "attention_context_left": 13, "attention_context_right": 0,
+        "attention_logit_cap": 50.0, "attention_invalid_logits_value": -1e9,
+        "rms_norm_eps": 1e-6, "gradient_clipping": 1e10, "output_proj_dims": 48,
+        "use_clipped_linears": true
     }
     """
 
