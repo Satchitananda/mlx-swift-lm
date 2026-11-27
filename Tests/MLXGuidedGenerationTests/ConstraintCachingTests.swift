@@ -9,16 +9,7 @@ import Testing
 ///
 /// The ModelCache stores compiled "template" constraints and clones them
 /// for each request, avoiding repeated grammar compilation (~5-20ms savings).
-@Suite(
-    .disabled(
-        """
-        GrammarConstraint.clone() requires xgrammar's GrammarMatcher::Fork() (xgrammar >= \
-        v0.1.34); the vendored version (v0.1.30) does not provide it, so every clone() \
-        in this suite throws. Production handles the absence gracefully — makeConstraint() \
-        catches forkFailed and recompiles a fresh constraint — so constraint caching is a \
-        perf-only optimization, not a correctness gap. Re-enable when the vendored \
-        xgrammar is bumped to a version with Fork().
-        """))
+@Suite
 struct ConstraintCachingTests {
 
     // MARK: - GrammarConstraint.clone() Tests
@@ -87,6 +78,45 @@ struct ConstraintCachingTests {
         #expect(
             !originalMask.isTerminated, "Original should be unaffected by clone's state changes"
         )
+    }
+
+    private func allows(_ mask: MaskResult, _ token: Int) -> Bool {
+        (UInt32(bitPattern: mask.mask[token / 32]) >> UInt32(token % 32)) & 1 == 1
+    }
+
+    /// Unlike `freshMatcher()`, a clone starts from the source's current
+    /// matcher state, and the two advance independently afterwards.
+    @Test
+    func clonedConstraintCarriesTheMatcherState() throws {
+        let source = try GrammarConstraint(
+            tokenizer: try makeByteFallbackTokenizer(), grammar: #"root ::= "abc""#)
+        _ = try source.commitToken(97)  // "a"
+
+        let cloned = try source.clone()
+        let clonedMask = try cloned.computeMask()
+        #expect(allows(clonedMask, 98))
+        #expect(!allows(clonedMask, 97))
+
+        _ = try cloned.commitToken(98)  // "b"
+        #expect(allows(try cloned.computeMask(), 99))
+        #expect(allows(try source.computeMask(), 98))
+        #expect(!allows(try source.computeMask(), 99))
+    }
+
+    /// A clone keeps the shared compiled grammar alive after its source is
+    /// released.
+    @Test
+    func clonedConstraintOutlivesItsSource() throws {
+        var source: GrammarConstraint? = try GrammarConstraint(
+            tokenizer: try makeByteFallbackTokenizer(), grammar: #"root ::= "ab""#)
+        _ = try source!.commitToken(97)  // "a"
+        let cloned = try source!.clone()
+        source = nil
+
+        _ = try cloned.commitToken(98)  // "b"
+        let mask = try cloned.computeMask()
+        #expect(allows(mask, 255))
+        #expect(!allows(mask, 97))
     }
 
     @Test

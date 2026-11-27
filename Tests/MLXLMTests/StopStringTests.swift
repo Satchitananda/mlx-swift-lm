@@ -38,6 +38,28 @@ final class StopStringTests: XCTestCase {
         XCTAssertEqual(config.stopStrings, ["<turn|>", "<fallback>"])
     }
 
+    func testGenerationConfigAppliesCheckpointSamplingDefaults() throws {
+        let data = Data(
+            """
+            {
+              "temperature": 0.1,
+              "top_p": 0.95,
+              "top_k": 50,
+              "min_p": 0.02,
+              "repetition_penalty": 1.1
+            }
+            """.utf8)
+
+        let config = try JSONDecoder().decode(GenerationConfigFile.self, from: data)
+        let defaults = config.applyingSamplingDefaults()
+
+        XCTAssertEqual(defaults.temperature, 0.1)
+        XCTAssertEqual(defaults.topP, 0.95)
+        XCTAssertEqual(defaults.topK, 50)
+        XCTAssertEqual(defaults.minP, 0.02)
+        XCTAssertEqual(defaults.repetitionPenalty, 1.1)
+    }
+
     func testModelConfigurationResolutionFallsBackToExtraEOSTokens() {
         let config = ModelConfiguration(
             id: "org/model",
@@ -271,6 +293,10 @@ private func runGenerateTask(
             chunks.append(text)
         case .info(let completion):
             info = completion
+        case .reasoning:
+            XCTFail("plain response unexpectedly parsed as reasoning")
+        case .steering:
+            XCTFail("no steering was requested")
         case .toolCall, .rejectedToolCall:
             XCTFail("plain response unexpectedly parsed as a tool call")
         }

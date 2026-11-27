@@ -1,5 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
+
 import Foundation
 import FoundationModels
 import Testing
@@ -13,8 +15,11 @@ import Testing
 ///
 /// Note: These tests have a 5-minute timeout to allow for model download
 /// and first-run shader compilation.
-@Suite(.serialized, .timeLimit(.minutes(5)))
-struct IntegrationTests {
+extension ModelLoadingSuite {
+    @Suite(.serialized, .timeLimit(.minutes(5))) struct IntegrationTests {}
+}
+
+extension ModelLoadingSuite.IntegrationTests {
 
     // MARK: - Real Inference Tests
 
@@ -314,3 +319,5 @@ struct IntegrationTests {
         #expect(tokenCount >= 5, "Should have received at least 5 tokens before cancellation")
     }
 }
+
+#endif  // FoundationModelsIntegration

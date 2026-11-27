@@ -1200,11 +1200,30 @@ struct MuseGlimmerAgenticProtocolTests {
     func conventions() throws {
         let model = try MuseGlimmerForwardTests.model()
         #expect(model.toolCallFormat == .atem)
+        #expect(model.reasoningConfig == OnyxReasoningProtocol.glimmer)
         #expect(model.reasoningConfig?.startDelimiter == "to=self<|message|>")
         #expect(model.reasoningConfig?.endDelimiter == "<|eom|>")
         #expect(VLMRegistry.museGlimmer30B4bit.toolCallFormat == .atem)
+        #expect(VLMRegistry.museGlimmer30B4bit.reasoningConfig == OnyxReasoningProtocol.glimmer)
         #expect(VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|eot|>"))
         #expect(VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|end_of_text|>"))
+    }
+
+    /// A budget cut must force the frame boundary and nothing else: the model
+    /// opens its own answer frame, and `<|eom|>` is not an end-of-turn token.
+    @Test("budget transition forces only the reasoning frame boundary")
+    func budgetTransitionClosesTheFrame() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let reasoning = OnyxReasoningProtocol.glimmer
+        #expect(reasoning.budgetTransition == .immediate)
+
+        let plan = try ThinkingBudgetPlan(
+            configuration: ThinkingBudgetConfiguration(maximumTokenCount: 8),
+            reasoning: reasoning,
+            tokenizer: tokenizer)
+
+        #expect(plan.forcedTransitionTokenIDs == [tokenizer.eom])
+        #expect(!VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|eom|>"))
     }
 
     @Test("ATEM parser extracts schema-typed arguments")
@@ -1359,6 +1378,30 @@ struct MuseGlimmerAgenticProtocolTests {
         #expect(answer == [.response("sunny")])
     }
 
+    @Test("the Onyx decoder can end for steering only after private or visible text")
+    func onyxEndsForSteeringOnlyAfterFrameText() throws {
+        let tokenizer = OnyxTestTokenizer()
+        var decoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: Self.tools, stopStrings: []))
+        let script: [(token: Int, canEnd: Bool)] = [
+            (tokenizer.id(" to=self"), false), (tokenizer.message, false),
+            (tokenizer.id("Plan"), true), (tokenizer.id(" it\n"), false), (tokenizer.eom, false),
+            (tokenizer.start, false), (tokenizer.id("assistant to=weather.get"), false),
+            (tokenizer.message, false), (tokenizer.id("<atem:function_calls>"), false),
+            (tokenizer.eom, false),
+            (tokenizer.start, false), (tokenizer.id("assistant to=user"), false),
+            (tokenizer.message, false), (tokenizer.id("Sunny"), true),
+            (tokenizer.id(" today\n"), false), (tokenizer.eot, false),
+        ]
+        for (token, canEnd) in script {
+            _ = decoder.push(token) { _ in true }
+            #expect(
+                decoder.canEndForSteering == canEnd,
+                "after \(tokenizer.decode(tokenIds: [token]).debugDescription)")
+        }
+    }
+
     @Test(
         "Onyx applies the selected validation policy and counts rejections",
         arguments: ToolCallValidationPolicy.allCases)
@@ -1481,6 +1524,71 @@ struct MuseGlimmerAgenticProtocolTests {
         #expect(events.contains { if case .protocolError = $0 { true } else { false } })
     }
 
+    private func onyxEvents(_ tokenizer: OnyxTestTokenizer, _ tokens: [Int]) throws
+        -> (reasoning: String, response: String)
+    {
+        var decoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: nil, stopStrings: []))
+        var events: [TokenStreamEvent] = []
+        for token in tokens {
+            _ = decoder.push(token) {
+                events.append($0)
+                return true
+            }
+        }
+        _ = decoder.finish {
+            events.append($0)
+            return true
+        }
+        return (
+            events.compactMap { if case .reasoning(let text) = $0 { text } else { nil } }.joined(),
+            events.compactMap { if case .response(let text) = $0 { text } else { nil } }.joined()
+        )
+    }
+
+    @Test("Onyx markers spelled out in the middle of a frame stay in that frame")
+    func literalMarkersInsideFrames() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let thought = "a frame is <|start|>assistant to=user<|message|> and ends with <|eot|>"
+        let answer = "private frames use <|start|>assistant to=self<|message|>"
+        let result = try onyxEvents(
+            tokenizer,
+            [
+                tokenizer.id(" to=self"), tokenizer.message, tokenizer.id(thought), tokenizer.eom,
+                tokenizer.start, tokenizer.id("assistant to=user"), tokenizer.message,
+                tokenizer.id(answer), tokenizer.eot,
+            ])
+
+        #expect(result.reasoning == thought)
+        #expect(result.response == answer)
+    }
+
+    @Test("an Onyx private frame that never closes is not shown as the answer")
+    func unclosedPrivateFrameStaysPrivate() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let result = try onyxEvents(
+            tokenizer,
+            [tokenizer.id(" to=self"), tokenizer.message, tokenizer.id("unfinished plan")])
+
+        #expect(result.response.isEmpty)
+    }
+
+    @Test("a frame started inside an unclosed Onyx private frame does not leak it")
+    func frameStartedInsideUnclosedPrivateFrame() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let result = try onyxEvents(
+            tokenizer,
+            [
+                tokenizer.id(" to=self"), tokenizer.message, tokenizer.id("first plan"),
+                tokenizer.start, tokenizer.id("assistant to=user"), tokenizer.message,
+                tokenizer.id("sunny"), tokenizer.eot,
+            ])
+
+        #expect(!result.response.contains("first plan"))
+        #expect(result.response == "sunny")
+    }
+
     @Test("prompt cache accounting follows each protocol's rendered call shape")
     func protocolSpecificCallAccounting() {
         let calls = [
@@ -1575,7 +1683,6 @@ struct MuseGlimmerOnyxCacheTests {
             cachedTokens: live,
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
-            draftCacheIsAligned: true,
             maxTrimCount: live.count)
 
         let decision = try #require(rule.reuse(turn: turn, cache: cache))
@@ -1608,7 +1715,6 @@ struct MuseGlimmerOnyxCacheTests {
             cachedTokens: live,
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
-            draftCacheIsAligned: true,
             maxTrimCount: live.count)
 
         let decision = try #require(rule.reuse(turn: turn, cache: cache))
@@ -1641,7 +1747,6 @@ struct MuseGlimmerOnyxCacheTests {
             cachedTokens: live,
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
-            draftCacheIsAligned: true,
             maxTrimCount: live.count)
 
         #expect(rule.reuse(turn: turn, cache: cache) == nil)

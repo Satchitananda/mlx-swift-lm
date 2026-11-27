@@ -111,6 +111,31 @@ class GrammarMatcher {
   bool FillNextTokenBitmask(DLTensor* next_token_bitmask, int index = 0, bool debug_print = false);
 
   /*!
+   * \brief Traverse a draft token tree and fill the token bitmask for each node.
+   *
+   * This function performs a DFS traversal of the speculative decoding tree and fills
+   * the token bitmask for each node based on grammar constraints.
+   *
+   * \param retrieve_next_token DLTensor where retrieve_next_token[i] gives the index of
+   *        the child node of node i, or -1 if no child exists.
+   * \param retrieve_next_sibling DLTensor where retrieve_next_sibling[i] gives the index of
+   *        the sibling node of node i, or -1 if no sibling exists.
+   * \param draft_tokens DLTensor of draft token ids at each node.
+   * \param token_bitmask DLTensor to store the bitmask (2D: num_nodes x bitmask_size).
+   * \param time_threshold Maximum allowed time in seconds for the DFS traversal.
+   *        If the traversal exceeds this threshold, it returns false.
+   *        A value <= 0 disables the timeout (default: -1.0).
+   * \return true if the traversal completed successfully, false if it timed out.
+   */
+  bool TraverseDraftTree(
+      const DLTensor* retrieve_next_token,
+      const DLTensor* retrieve_next_sibling,
+      const DLTensor* draft_tokens,
+      DLTensor* token_bitmask,
+      double time_threshold = -1.0
+  );
+
+  /*!
    * \brief Find the jump-forward string for jump-forward decoding. This is the longest string that
    will be valid according to the current syntax.
    * \note This method does not change the grammar state.
@@ -130,8 +155,21 @@ class GrammarMatcher {
    */
   bool IsTerminated() const;
 
+  /*!
+   * \brief Check if the grammar's root rule has been fully matched by the input accepted so far.
+   * Unlike IsTerminated(), this does not require the stop token to have been accepted.
+   * \sa IsTerminated, AcceptToken
+   */
+  bool IsCompleted() const;
+
   /*! \brief Reset the matcher to the initial state. */
   void Reset();
+
+  /*!
+   * \brief Fork the matcher. Returns a new GrammarMatcher with a deep copy of all state except
+   * compiled_grammar and tokenizer_info, which are shared with this matcher.
+   */
+  GrammarMatcher Fork() const;
 
   /*! \brief Get the maximum number of rollback tokens allowed. */
   int GetMaxRollbackTokens() const;
@@ -199,6 +237,15 @@ class BatchGrammarMatcher {
       std::vector<GrammarMatcher>* matchers,
       const std::vector<int32_t>& token_ids,
       bool debug_print = false
+  );
+
+  /*!
+   * \brief A batched version of Rollback for better efficiency.
+   * \param matchers The array of GrammarMatcher objects.
+   * \param num_tokens The array of the number of tokens to rollback for each matcher.
+   */
+  static void BatchRollback(
+      std::vector<GrammarMatcher>* matchers, const std::vector<int>& num_tokens
   );
 
   XGRAMMAR_DEFINE_PIMPL_METHODS(BatchGrammarMatcher);

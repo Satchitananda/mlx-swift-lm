@@ -195,6 +195,43 @@ XGStatus xg_compile_json_schema(
 );
 
 /*
+ * JSON formatting and strictness for `xg_compile_json_schema_with_format`.
+ * Fields map 1:1 onto `GrammarCompiler::CompileJSONSchema`'s parameters:
+ *   any_whitespace -- nonzero allows any JSON whitespace between tokens.
+ *                     When set, xgrammar ignores `indent` and the
+ *                     separators.
+ *   indent         -- spaces per nesting level; negative means unset
+ *                     (single-line output).
+ *   item_separator, key_separator
+ *                  -- NUL-terminated separator strings, both set or both
+ *                     NULL. NULL keeps xgrammar's defaults: ", " / ": "
+ *                     without an indent, "," / ": " with one.
+ *   strict_mode    -- nonzero forbids properties and items the schema
+ *                     does not declare.
+ * `max_whitespace_cnt` stays unset.
+ */
+typedef struct XGJSONSchemaFormat {
+    int32_t any_whitespace;
+    int32_t indent;
+    const char *item_separator;
+    const char *key_separator;
+    int32_t strict_mode;
+} XGJSONSchemaFormat;
+
+/*
+ * Same as `xg_compile_json_schema`, with explicit formatting. A NULL
+ * `format` uses xgrammar's defaults, which equal
+ * `xg_compile_json_schema`. Exactly one NULL separator returns
+ * `XG_ERR_INVALID_ARG` and leaves `*out_compiled` untouched.
+ */
+XGStatus xg_compile_json_schema_with_format(
+    XGGrammarCompiler *compiler,
+    const char *schema_json,
+    const XGJSONSchemaFormat *format,
+    XGCompiledGrammar **out_compiled
+);
+
+/*
  * Release a handle returned by `xg_compile_json_schema`. Safe to call
  * with a NULL pointer.
  */

@@ -7,8 +7,8 @@ import MLXLMCommon
 ///
 /// When the grammar forces deterministic tokens (e.g. JSON structural
 /// characters `{`, `}`, `,`, `:`), they're fed through the model one at
-/// a time to update the KV cache. Each pass uses the optimized T_q=1
-/// Metal kernel.
+/// a time to update the KV cache, after the sampled token that preceded
+/// them. Each pass uses the optimized T_q=1 Metal kernel.
 ///
 /// The loop overlaps grammar mask computation (CPU) with the model forward
 /// pass (GPU). After committing a token, the grammar state is ready for the
@@ -20,10 +20,7 @@ import MLXLMCommon
 /// KV cache.
 public enum GuidedGenerationLoop {
 
-    private static let logger = Logger(
-        subsystem: "com.apple.FoundationModels-MLX",
-        category: "GuidedGenerationLoop"
-    )
+    private static let logger = MLXLogger(label: "GuidedGenerationLoop")
 
     /// Result of a single generation step.
     enum StepResult {
@@ -75,6 +72,15 @@ public enum GuidedGenerationLoop {
     ///     Used by the run tracker to detect consecutive whitespace runs.
     ///   - diagnosticLog: When true, flush the grammar constraint's diagnostic
     ///     logs after the run completes. Defaults to false.
+    ///   - logitProcessor: Optional processor, such as
+    ///     `GenerateParameters.processor()` for repetition, presence and
+    ///     frequency penalties. It processes the raw logits before the grammar
+    ///     mask. As in `TokenIterator`, `didSample` sees every sampled token,
+    ///     including a stop token, and `didEmit` every token in the output.
+    ///     Fast-forward tokens get both calls but are not processed or sampled.
+    ///   - logitSampler: Sampler applied to the masked logits, such as
+    ///     `GenerateParameters.sampler()` for temperature, top-p, top-k and
+    ///     min-p. Nil samples greedily.
     ///   - prefill: Prompt prefill parameters (step size, chunking strategy,
     ///     progress callback). Defaults to a 512-token step with balanced
     ///     chunking.
@@ -82,8 +88,11 @@ public enum GuidedGenerationLoop {
     /// - Returns: Total number of tokens generated (including FF tokens).
     /// - Throws: `GuidedGenerationError.incompleteOutput` if maxTokens is
     ///   exhausted before the grammar reaches a stop state.
-    ///   `GuidedGenerationError.prematureEOS` if the model emits EOS
-    ///   before the grammar accepts.
+    ///   `GuidedGenerationError.prematureEOS` if the model emits a stop
+    ///   token that the grammar tokenizer does not register (or the
+    ///   unknown token) before the grammar can terminate. Registered stop
+    ///   tokens are masked until then, so register every stop token with
+    ///   `GrammarTokenizer(vocab:vocabType:stopTokenIds:)`.
     @discardableResult
     public static func run(
         input: LMInput,
@@ -101,6 +110,8 @@ public enum GuidedGenerationLoop {
         whitespaceBias: MLXArray? = nil,
         whitespaceTokenIDs: Set<Int> = [],
         diagnosticLog: Bool = false,
+        logitProcessor: (any LogitProcessor)? = nil,
+        logitSampler: (any LogitSampler)? = nil,
         prefill: PrefillParameters = .init(stepSize: PrefillParameters.defaultStepSize),
         emit: (String) -> Bool
     ) throws -> Int {
@@ -116,12 +127,18 @@ public enum GuidedGenerationLoop {
             KVCacheStorage(
                 try model.newCache(parameters: generationParameters), plan: kvCachePlan))
         var modelState: LMOutput.State?
+        var processor = logitProcessor
+        processor?.prompt(input.text.tokens)
+        defer { processor?.finalizeGeneration() }
 
-        // Build EOS token set
+        // Build the stop set: the configuration's and tokenizer's stop
+        // tokens plus every stop token the grammar tokenizer registers. The
+        // grammar masks only the registered ones until it can terminate.
+        let registeredStopTokenIDs = Set(constraint.stopTokenIds.map(Int.init))
         let stopTokenIDs = Self.buildStopTokenIDs(
             tokenizer: context.tokenizer,
             configuration: context.configuration
-        )
+        ).union(registeredStopTokenIDs)
 
         // Prefill prompt and get first set of logits
         var logits: MLXArray
@@ -279,9 +296,18 @@ public enum GuidedGenerationLoop {
             let token = applyMaskAndSample(
                 logits: logits,
                 maskArray: maskArray,
-                closingBias: activeBias
+                closingBias: activeBias,
+                logitProcessor: processor,
+                logitSampler: logitSampler
             )
             let tokenId = Int(token)
+
+            // A caller's sampler must not pick a token the grammar excludes.
+            if mask.needsApply && !maskAllows(mask, tokenId: tokenId, vocabSize: vocabSize) {
+                throw GrammarError.commitFailed(
+                    "the sampler chose token \(tokenId), which the grammar does not allow")
+            }
+            processor?.didSample(token: MLXArray([Int32(tokenId)]))
 
             // Track the sampled token for whitespace run detection.
             // Fast-forward tokens are NOT tracked (they are grammar-forced).
@@ -297,17 +323,28 @@ public enum GuidedGenerationLoop {
             // model's raw logits might have EOS as the highest value
             // even though the grammar has NOT accepted the output.
             //
-            // When `needsApply` IS true: if the grammar mask allowed
-            // EOS (bit = 1), the grammar considers the output
-            // acceptable. If the mask did NOT allow EOS,
-            // `applyMaskAndSample` set it to -inf, so argmax would not
-            // have selected it.
+            // When `needsApply` IS true: a stop token registered with the
+            // grammar tokenizer is in the mask only when the grammar can
+            // terminate, so sampling it ends the output acceptably. Any
+            // other stop id (one the grammar tokenizer does not register,
+            // or the unknown token) is ordinary text to the grammar and
+            // can be allowed inside an unfinished value. It ends the output
+            // acceptably only where a registered stop is also allowed;
+            // anywhere else the output is incomplete.
             if mask.needsApply {
                 if tokenId == context.tokenizer.unknownTokenId || stopTokenIDs.contains(tokenId) {
                     if diagnosticLog {
                         logger.info(
                             "[GuidedGen] Stop reason: EOS/unk tokenId=\(tokenId) at token \(tokenCount)"
                         )
+                    }
+                    let grammarCanTerminate =
+                        registeredStopTokenIDs.contains(tokenId)
+                        || registeredStopTokenIDs.contains {
+                            maskAllows(mask, tokenId: $0, vocabSize: vocabSize)
+                        }
+                    guard grammarCanTerminate else {
+                        throw GuidedGenerationError.prematureEOS
                     }
                     grammarStopped = true
                     break
@@ -320,6 +357,7 @@ public enum GuidedGenerationLoop {
             diagnosticSink?.recordSampledToken(tokenId)
             // Yield the sampled token
             detokenizer.append(token: tokenId)
+            processor?.didEmit(token: tokenId)
             if let text = detokenizer.next() {
                 accumulatedText += text
                 if !emit(text) {
@@ -372,8 +410,10 @@ public enum GuidedGenerationLoop {
                         shouldStopAfterFF = true
                         break
                     }
+                    processor?.didSample(token: MLXArray([ffToken]))
                     diagnosticSink?.recordFastForwardToken(Int(ffToken))
                     detokenizer.append(token: Int(ffToken))
+                    processor?.didEmit(token: Int(ffToken))
                     if let text = detokenizer.next() {
                         accumulatedText += text
                         if !emit(text) {
@@ -387,15 +427,17 @@ public enum GuidedGenerationLoop {
 
                 if shouldStopAfterFF { break }
 
-                // Process FF tokens one at a time to update KV cache.
+                // Feed the sampled token before its FF tokens, so later logits
+                // condition on the same tokens as the output.
                 // Batching (T_q > 1 with populated cache) triggers an MLX
                 // bug: scaledDotProductAttention in .causal mode creates a
                 // mask of shape (T_q, T_q) instead of (T_q, T_kv), causing
                 // a broadcast failure on models with global attention layers
                 // (e.g., Gemma 3). Single-token passes (T_q=1) use the
                 // optimized Metal kernel and skip the mask entirely.
-                for (i, ffToken) in ffTokens.enumerated() {
-                    let tokenInput = LMInput.Text(tokens: MLXArray([ffToken]))
+                let fedTokens = [Int32(tokenId)] + ffTokens
+                for (i, fedToken) in fedTokens.enumerated() {
+                    let tokenInput = LMInput.Text(tokens: MLXArray([fedToken]))
                     let result = model(
                         tokenInput[text: .newAxis],
                         cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
@@ -404,7 +446,7 @@ public enum GuidedGenerationLoop {
                     cacheStorage.commitProcessedTokens(tokenInput.cacheSequenceLength)
                     modelState = result.state
                     // Only need logits from the last FF token
-                    if i == ffTokens.count - 1 {
+                    if i == fedTokens.count - 1 {
                         logits = result.logits
                     }
                 }
@@ -501,6 +543,10 @@ public enum GuidedGenerationLoop {
     ///    some Gemma variants in `LLMModelFactory`). Callers needing extra
     ///    stop tokens add them here (via the model configuration), not as a
     ///    per-call argument.
+    ///
+    /// `run` adds the stop tokens registered on the constraint's
+    /// `GrammarTokenizer`. Register the same ids there (all three sources)
+    /// so the grammar masks every stop token until it can terminate.
     static func buildStopTokenIDs(
         tokenizer: any Tokenizer,
         configuration: ModelConfiguration
@@ -530,14 +576,19 @@ public enum GuidedGenerationLoop {
     ///     tokens (no mask to apply).
     ///   - closingBias: Optional logit bias favoring closing tokens. Applied
     ///     after the grammar mask so masked-out tokens remain at -inf.
+    ///   - logitProcessor: Optional processor, applied before the grammar mask.
+    ///   - logitSampler: Sampler for the masked logits. Nil samples greedily.
     /// - Returns: The sampled token ID.
     static func applyMaskAndSample(
         logits rawLogits: MLXArray,
         maskArray: MLXArray?,
-        closingBias: MLXArray? = nil
+        closingBias: MLXArray? = nil,
+        logitProcessor: (any LogitProcessor)? = nil,
+        logitSampler: (any LogitSampler)? = nil
     ) -> UInt32 {
         // Extract last-position logits: [batch, seq, vocab] -> [vocab]
         var logits = rawLogits[0..., -1, 0...]
+        logits = logitProcessor?.process(logits: logits) ?? logits
 
         if let maskArray {
             logits = logits + maskArray
@@ -560,9 +611,17 @@ public enum GuidedGenerationLoop {
             }
         }
 
-        // Grammar-constrained generation samples greedily by construction.
-        let sampled = argMax(logits, axis: -1)
+        let sampled = logitSampler?.sample(logits: logits) ?? argMax(logits, axis: -1)
         return sampled.item(UInt32.self)
+    }
+
+    /// Whether `mask` allows `tokenId`. Ids at or beyond `vocabSize` are never
+    /// allowed, matching `bitmaskToMLXArray`.
+    static func maskAllows(_ mask: MaskResult, tokenId: Int, vocabSize: Int) -> Bool {
+        guard tokenId >= 0, tokenId < vocabSize, tokenId / 32 < mask.mask.count else {
+            return false
+        }
+        return (UInt32(bitPattern: mask.mask[tokenId / 32]) >> UInt32(tokenId % 32)) & 1 == 1
     }
 
     /// Build the additive grammar-mask array for a freshly computed `MaskResult`,

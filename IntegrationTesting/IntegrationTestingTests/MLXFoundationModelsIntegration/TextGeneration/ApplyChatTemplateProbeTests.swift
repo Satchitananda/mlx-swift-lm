@@ -1,5 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
+
 import Foundation
 import MLXLMCommon
 import Testing
@@ -12,8 +14,11 @@ import Testing
 /// calls `applyChatTemplate` on the underlying tokenizer. These probes
 /// exercise that path directly through the MLXLMCommon `Tokenizer` protocol
 /// surface, with and without tools.
-@Suite(.serialized, .timeLimit(.minutes(3)))
-struct ApplyChatTemplateProbeTests {
+extension ModelLoadingSuite {
+    @Suite(.serialized, .timeLimit(.minutes(3))) struct ApplyChatTemplateProbeTests {}
+}
+
+extension ModelLoadingSuite.ApplyChatTemplateProbeTests {
 
     @Test
     func applyChatTemplateWithoutToolsDoesNotCrash() async throws {
@@ -68,3 +73,5 @@ struct ApplyChatTemplateProbeTests {
         }
     }
 }
+
+#endif  // FoundationModelsIntegration

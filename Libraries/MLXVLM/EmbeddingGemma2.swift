@@ -12,6 +12,14 @@ public typealias EmbeddingGemma2Configuration = MLXLMCommon.EmbeddingGemma2Confi
 /// The shared EmbeddingGemma 2 encoder.
 public typealias EmbeddingGemma2 = MLXLMCommon.EmbeddingGemma2
 
+#if compiler(>=6.2)
+private let embeddingImageContext = CIContext(options: [.cacheIntermediates: false])
+#else
+nonisolated(unsafe) private let embeddingImageContext = CIContext(options: [
+    .cacheIntermediates: false
+])
+#endif
+
 // MARK: - Image Preparation
 
 /// Prepares images as the reference `Gemma4ImageProcessor` does: the target size and
@@ -48,9 +56,13 @@ package struct EmbeddingGemma2ImageProcessor: Sendable {
         )
     }
 
-    /// The oriented image on the sRGB tone curve, as the reference reads it.
+    /// The image turned upright by its EXIF orientation, on the sRGB tone curve, as the
+    /// reference reads it. An image decoded with `applyOrientationProperty` carries no
+    /// orientation and stays as it is.
     static func prepared(_ image: CIImage) throws -> CIImage {
-        let oriented = image.settingProperties([CIImageOption.applyOrientationProperty: true])
+        let orientation = (image.properties[kCGImagePropertyOrientation as String] as? UInt32)
+            .flatMap(CGImagePropertyOrientation.init(rawValue:))
+        let oriented = orientation.map(image.oriented) ?? image
         guard !oriented.extent.isEmpty, !oriented.extent.isInfinite else {
             throw EmbeddingGemma2Embedding.Error.invalidMedia
         }
@@ -59,19 +71,84 @@ package struct EmbeddingGemma2ImageProcessor: Sendable {
 
     /// `[1, 3, height, width]` pixels in `0...1`.
     static func pixels(_ image: CIImage, height: Int, width: Int) -> MLXArray {
-        let pixels = MediaProcessing.asMLXArray(image)
-        guard pixels.dim(2) != height || pixels.dim(3) != width else { return pixels }
+        let bounds = image.extent
+        let sourceWidth = Int(bounds.width.rounded())
+        let sourceHeight = Int(bounds.height.rounded())
+        // Half precision keeps JPEG's extended range without a full-size float32 buffer.
+        var data = Data(count: sourceWidth * sourceHeight * 8)
+        data.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            embeddingImageContext.render(
+                image, toBitmap: base, rowBytes: sourceWidth * 8, bounds: bounds,
+                format: .RGBAh, colorSpace: nil)
+            embeddingImageContext.clearCaches()
+        }
+        let pixels = MLXArray(data, [1, sourceHeight, sourceWidth, 4], dtype: .float16)[
+            0..., 0..., 0..., ..<3
+        ].transposed(0, 3, 1, 2)
+        guard sourceHeight != height || sourceWidth != width else {
+            return pixels.asType(.float32)
+        }
         return resized(pixels, height: height, width: width)
     }
 
     /// Separable resize as two matrix products, rounded to 8 bits like the reference's
-    /// `uint8` output.
+    /// `uint8` output. Each pass reads only the nonzero weights and casts pixels as it reads.
     static func resized(_ pixels: MLXArray, height: Int, width: Int) -> MLXArray {
-        let rows = bicubicWeights(input: pixels.dim(2), output: height)
-        let columns = bicubicWeights(input: pixels.dim(3), output: width)
-        let resized = matmul(matmul(rows, pixels), columns.transposed())
-        return round(clip(resized * 255, min: 0, max: 255)) / 255
+        if Device.defaultDevice().deviceType == .cpu {
+            let rows = bicubicWeights(input: pixels.dim(2), output: height)
+            let columns = bicubicWeights(input: pixels.dim(3), output: width)
+            let resized = matmul(matmul(rows, pixels.asType(.float32)), columns.transposed())
+            return round(clip(resized * 255, min: 0, max: 255)) / 255
+        }
+        var pixels = pixels
+        for (axis, length) in [(2, height), (3, width)] where pixels.dim(axis) != length {
+            let weights = bicubicWeights(input: pixels.dim(axis), output: length)
+            let parameters = MLXArray([
+                Int32(pixels.dim(2)), Int32(pixels.dim(3)), Int32(length),
+                Int32(axis),
+            ])
+            var shape = pixels.shape
+            shape[axis] = length
+            pixels =
+                resizeAxis(
+                    [pixels, weights, parameters],
+                    grid: (shape[3], shape[2], shape[0] * shape[1]),
+                    threadGroup: (32, 8, 1), outputShapes: [shape], outputDTypes: [.float32]
+                )[0]
+        }
+        return round(clip(pixels * 255, min: 0, max: 255)) / 255
     }
+
+    private static let resizeAxis = MLXFast.metalKernel(
+        name: "embedding_gemma2_resize_axis",
+        inputNames: ["pixels", "weights", "parameters"], outputNames: ["output"],
+        source: """
+            const int x = thread_position_in_grid.x;
+            const int y = thread_position_in_grid.y;
+            const int channel = thread_position_in_grid.z;
+            const int inH = parameters[0], inW = parameters[1], length = parameters[2];
+            const bool vertical = parameters[3] == 2;
+            const int outH = vertical ? length : inH, outW = vertical ? inW : length;
+            if (x >= outW || y >= outH) return;
+            const int inputLength = vertical ? inH : inW;
+            const int position = vertical ? y : x;
+            const float scale = float(inputLength) / float(length);
+            const float support = 2.0f * max(scale, 1.0f);
+            const float center = (float(position) + 0.5f) * scale;
+            const int first = max(0, int(center - support) - 1);
+            const int last = min(inputLength, int(center + support) + 2);
+            float value = 0;
+            for (int i = first; i < last; ++i) {
+                const int offset = vertical
+                    ? (channel * inH + i) * inW + x
+                    : (channel * inH + y) * inW + i;
+                const float sample = float(pixels[offset]);
+                value += sample * weights[position * inputLength + i];
+            }
+            output[(channel * outH + y) * outW + x] = value;
+            """
+    )
 
     /// `[output, input]` interpolation weights of the antialiased bicubic filter
     /// (a = -0.5) of Pillow and torchvision.
@@ -422,6 +499,23 @@ package enum EmbeddingGemma2Sequence {
         return tokens
     }
 
+    /// Groups sequences into batches of similar length. A batch pads to its longest row and
+    /// holds at most `limit` tokens, padding included; a longer sequence forms a batch alone.
+    /// - Returns: Indices into `lengths`, shortest first.
+    package static func batches(lengths: [Int], limit: Int) -> [[Int]] {
+        let order = lengths.indices.sorted { (lengths[$0], $0) < (lengths[$1], $1) }
+        var batches: [[Int]] = []
+        for index in order {
+            // Ascending order makes this sequence the longest row of the batch.
+            if let last = batches.last, (last.count + 1) * lengths[index] <= limit {
+                batches[batches.count - 1].append(index)
+            } else {
+                batches.append([index])
+            }
+        }
+        return batches
+    }
+
     /// The placeholder block of a media segment; `nil` for text.
     private static func block(_ segment: Segment, _ configuration: EmbeddingGemma2Configuration)
         throws -> [Int]?
@@ -468,63 +562,17 @@ package enum EmbeddingGemma2Sequence {
 ///     .init([.text("Aurora over Tromsø: "), .video(.url(movie)), .audio(.url(narration))]),
 ///     task: .document)
 /// ```
-public actor EmbeddingGemma2Embedding {
+public actor EmbeddingGemma2Embedding: MultimodalEmbedding {
 
-    /// Input kinds accepted by this loaded checkpoint.
-    public enum Modality: Hashable, Sendable {
-        case text, image, video, audio
-    }
+    public typealias Modality = EmbeddingModality
+    /// Media keeps its own budget: video samples one frame per second, at most 32, without
+    /// the audio track; audio is mono and keeps its first 30 seconds.
+    public typealias Input = EmbeddingInput
+    public typealias Task = EmbeddingTask
 
     /// Modalities declared by the checkpoint and allowed by the loading policy.
     /// Encoders and processors load on first use.
     public let supportedModalities: Set<Modality>
-
-    /// One independently embedded item: text and media in reading order.
-    public struct Input {
-
-        /// One piece of an input.
-        public enum Part {
-            case text(String)
-            case image(UserInput.Image)
-            /// One frame per second, at most 32, without the audio track.
-            case video(UserInput.Video)
-            /// Mono audio; the first 30 seconds count.
-            case audio(UserInput.Audio)
-            /// The video of an `embed(sharingVideo:variants:task:dimensions:)` call, encoded
-            /// once for all of its variants, at this position. Valid only in such a variant
-            /// and at most once per variant; anywhere else it throws
-            /// ``EmbeddingGemma2Embedding/Error/misplacedSharedVideo``.
-            case sharedVideo
-        }
-
-        public let parts: [Part]
-        /// A document title or file name; used by the `.document` task.
-        public let title: String?
-
-        public init(_ parts: [Part], title: String? = nil) {
-            self.parts = parts
-            self.title = title
-        }
-
-        /// Text followed by images.
-        public init(text: String = "", title: String? = nil, images: [UserInput.Image] = []) {
-            self.init([.text(text)] + images.map(Part.image), title: title)
-        }
-    }
-
-    /// The task an embedding is prepared for. Use `.searchQuery` for queries and
-    /// `.document` for corpus items; compared items must share a task's space.
-    public enum Task: Sendable {
-        case searchQuery
-        case document
-        case clustering
-        case classification
-        case questionAnswering
-        case factChecking
-        case codeRetrieval
-        case sentenceSimilarity
-        case none
-    }
 
     public enum Error: Swift.Error, LocalizedError, Sendable {
         case emptyInput
@@ -561,6 +609,10 @@ public actor EmbeddingGemma2Embedding {
     }
 
     private let model: EmbeddingGemma2
+    /// Tokens in one text batch, padding included. Larger batches use more memory and are
+    /// not faster: on an M2, 64 document chunks took 2.45 s with 1,024 tokens per batch,
+    /// 2.81 s with 8,192, and 4.20 s one at a time.
+    private static let batchTokens = 1_024
     private let tokenizer: any Tokenizer
     private let modelDirectory: URL
     private var imageProcessor: EmbeddingGemma2ImageProcessor?
@@ -580,21 +632,37 @@ public actor EmbeddingGemma2Embedding {
         excludedComponents: Set<ModelComponent> = [],
         componentLoading: ComponentLoading = .onFirstUse
     ) async throws {
+        var configuration = ResolvedModelConfiguration(directory: modelDirectory)
+        configuration.excludedComponents = excludedComponents
+        if !loadVision { configuration.excludedComponents.insert(.vision) }
+        if !loadAudio { configuration.excludedComponents.insert(.audio) }
+        try await self.init(
+            configuration: configuration, tokenizerLoader: tokenizerLoader,
+            componentLoading: componentLoading)
+    }
+
+    package init(
+        configuration: ResolvedModelConfiguration, tokenizerLoader: any TokenizerLoader,
+        componentLoading: ComponentLoading = .onFirstUse
+    ) async throws {
+        let modelDirectory = configuration.modelDirectory
         let configData = try Data(contentsOf: modelDirectory.appendingPathComponent("config.json"))
-        let config = try JSONDecoder().decode(EmbeddingGemma2Configuration.self, from: configData)
+        let config = try JSONDecoder.json5().decode(
+            EmbeddingGemma2Configuration.self, from: configData)
         let model = EmbeddingGemma2(config)
-        let base = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
-        var excluded = excludedComponents
-        if !loadVision { excluded.insert(.vision) }
-        if !loadAudio { excluded.insert(.audio) }
+        let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: base.perLayerQuantization,
-            excludedComponents: excluded, componentLoading: componentLoading)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents, componentLoading: componentLoading
+        )
         try Swift.Task.checkCancellation()
+        let tokenizer = try await tokenizerLoader.load(from: configuration.tokenizerDirectory)
+        try model.validate(tokenizer: tokenizer)
         self.model = model
         self.modelDirectory = modelDirectory
-        self.tokenizer = try await tokenizerLoader.load(from: modelDirectory)
+        self.tokenizer = tokenizer
         var modalities: Set<Modality> = [.text]
         if model.supportedComponents.contains(.vision) {
             modalities.insert(.image)
@@ -604,28 +672,64 @@ public actor EmbeddingGemma2Embedding {
         self.supportedModalities = modalities
     }
 
-    /// Embeds independent items in input order, one at a time to bound working memory.
+    /// Embeds independent items in input order; returns unit-length float32 vectors.
     /// Retrieval uses `.searchQuery` for queries and `.document` for corpus items.
+    ///
+    /// Items with media run one at a time. Each media item's soft tokens are evaluated
+    /// before the next one is prepared, so only one encoder's activations are alive at a
+    /// time. Text runs in padded batches of similar length, at most 1,024 tokens each;
+    /// a longer text runs alone.
     public func embed(
         _ inputs: [Input], task: Task, dimensions: Int? = nil
     ) async throws -> [[Float]] {
-        var vectors: [[Float]] = []
-        vectors.reserveCapacity(inputs.count)
-        for input in inputs {
+        let dimension = try outputDimension(dimensions)
+        var vectors = [[Float]](repeating: [], count: inputs.count)
+        var texts: [(index: Int, tokens: [Int])] = []
+        for (index, input) in inputs.enumerated() {
             try Swift.Task.checkCancellation()
-            vectors.append(try await embed(input, task: task, dimensions: dimensions))
+            let (tokens, softTokens) = try await sequence(input, task: task)
+            guard let softTokens else {
+                texts.append((index, tokens))
+                continue
+            }
+            let vector = model.embed(
+                inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]),
+                attentionMask: nil, softTokens: softTokens)
+            vectors[index] = try Self.unitRows(vector, dimension: dimension)[0]
         }
+        let batches = EmbeddingGemma2Sequence.batches(
+            lengths: texts.map(\.tokens.count), limit: Self.batchTokens)
+        for batch in batches {
+            try Swift.Task.checkCancellation()
+            let rows = batch.map { texts[$0].tokens }
+            let width = rows.map(\.count).max() ?? 0
+            // Padding is masked out of attention and pooling, so its token does not matter.
+            let ids = rows.flatMap { $0 + repeatElement(0, count: width - $0.count) }
+            let mask = rows.flatMap {
+                [Int32](repeating: 1, count: $0.count) + repeatElement(0, count: width - $0.count)
+            }
+            let output = model.embed(
+                inputIds: MLXArray(ids.map(Int32.init), [rows.count, width]),
+                attentionMask: rows.allSatisfy { $0.count == width }
+                    ? nil : MLXArray(mask, [rows.count, width]))
+            for (row, vector) in zip(batch, try Self.unitRows(output, dimension: dimension)) {
+                vectors[texts[row].index] = vector
+            }
+        }
+        try Swift.Task.checkCancellation()
         return vectors
     }
 
     /// Embeds one item; returns a unit-length float32 vector.
-    ///
-    /// Each media item's soft tokens are evaluated before the next one is prepared, so
-    /// only one encoder's activations are alive at a time.
     public func embed(
         _ input: Input, task: Task, dimensions: Int? = nil
     ) async throws -> [Float] {
-        try await embed(input, task: task, dimensions: dimensions, sharedVideo: nil)
+        try await embed([input], task: task, dimensions: dimensions)[0]
+    }
+
+    /// Embeds independent items at the checkpoint's full output size.
+    public func embed(_ inputs: sending [Input], task: Task) async throws -> [[Float]] {
+        try await embed(inputs, task: task, dimensions: nil)
     }
 
     /// Embeds variants of one video, running the vision tower over its frames once.
@@ -635,7 +739,7 @@ public actor EmbeddingGemma2Embedding {
     /// normalization follow ``embed(_:task:dimensions:)`` exactly, so a variant's vector
     /// equals the one it would get with `.video(video)` in that position. The shared
     /// soft tokens live for this call only; each variant's other media is evaluated and
-    /// released in turn.
+    /// released in turn, and variants run one at a time.
     ///
     /// - Throws: Before any frame is decoded: ``Error/emptyInput`` without variants or for
     ///   a variant with neither text nor media, ``Error/unsupportedMedia`` when the
@@ -652,7 +756,7 @@ public actor EmbeddingGemma2Embedding {
         try Swift.Task.checkCancellation()
         guard !variants.isEmpty else { throw Error.emptyInput }
         guard supportedModalities.contains(.video) else { throw Error.unsupportedMedia }
-        _ = try dimension(dimensions)
+        let dimension = try outputDimension(dimensions)
         for variant in variants {
             try validate(variant, sharingVideo: true)
         }
@@ -662,22 +766,34 @@ public actor EmbeddingGemma2Embedding {
         vectors.reserveCapacity(variants.count)
         for variant in variants {
             try Swift.Task.checkCancellation()
-            vectors.append(
-                try await embed(variant, task: task, dimensions: dimensions, sharedVideo: shared))
+            let (tokens, softTokens) = try await sequence(
+                variant, task: task, sharedVideo: shared)
+            let vector = model.embed(
+                inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]),
+                attentionMask: nil, softTokens: softTokens)
+            vectors.append(try Self.unitRows(vector, dimension: dimension)[0])
         }
+        try Swift.Task.checkCancellation()
         return vectors
     }
 
     /// The soft tokens of one encoded media item and the segment they fill.
     private typealias Encoded = (segment: EmbeddingGemma2Sequence.Segment, features: MLXArray)
 
-    /// The one implementation behind both public entry points; `sharedVideo` fills the
-    /// input's `.sharedVideo` part.
-    private func embed(
-        _ input: Input, task: Task, dimensions: Int?, sharedVideo: Encoded?
-    ) async throws -> [Float] {
-        try Swift.Task.checkCancellation()
-        let dimension = try dimension(dimensions)
+    private func outputDimension(_ requested: Int?) throws -> Int {
+        let dimension = requested ?? model.config.embeddingDim
+        guard
+            dimension == model.config.embeddingDim
+                || ([128, 256, 512].contains(dimension) && dimension <= model.config.embeddingDim)
+        else { throw Error.invalidDimension }
+        return dimension
+    }
+
+    /// The token sequence of one input, and the soft tokens that fill its media; `nil`
+    /// when it has none. `sharedVideo` fills the input's `.sharedVideo` part.
+    private func sequence(_ input: Input, task: Task, sharedVideo: Encoded? = nil) async throws
+        -> (tokens: [Int], softTokens: MLXArray?)
+    {
         try validate(input, sharingVideo: sharedVideo != nil)
         let hasText = input.hasText
         guard let begin = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }),
@@ -720,29 +836,7 @@ public actor EmbeddingGemma2Embedding {
         let tokens = try EmbeddingGemma2Sequence.tokens(
             segments, configuration: model.config, beginOfSequence: begin, endOfSequence: end,
             limit: EmbeddingGemma2Configuration.contextLength)
-        let vector = model.embed(
-            inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]), attentionMask: nil,
-            softTokens: softTokens.isEmpty ? nil : concatenated(softTokens, axis: 0))
-        try MLX.checkedEval(vector)
-        try Swift.Task.checkCancellation()
-        let values = vector.asArray(Float.self)
-        let truncated = Array(values.prefix(dimension))
-        guard values.allSatisfy(\.isFinite), values.contains(where: { $0 != 0 }) else {
-            throw Error.invalidEmbedding
-        }
-        let norm = truncated.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
-        guard norm.isFinite, norm > 0 else { throw Error.invalidEmbedding }
-        return truncated.map { Float(Double($0) / norm) }
-    }
-
-    /// The output size a request asks for: the checkpoint's, or a Matryoshka prefix.
-    private func dimension(_ requested: Int?) throws -> Int {
-        let dimension = requested ?? model.config.embeddingDim
-        guard
-            dimension == model.config.embeddingDim
-                || ([128, 256, 512].contains(dimension) && dimension <= model.config.embeddingDim)
-        else { throw Error.invalidDimension }
-        return dimension
+        return (tokens, softTokens.isEmpty ? nil : concatenated(softTokens, axis: 0))
     }
 
     /// Rejects an input this checkpoint or call cannot embed, before any media is decoded.
@@ -762,6 +856,23 @@ public actor EmbeddingGemma2Embedding {
         }
         guard input.hasText || input.parts.contains(where: { $0.text == nil }) else {
             throw Error.emptyInput
+        }
+    }
+
+    /// The rows of `[B, embeddingDim]` vectors, truncated to `dimension` at unit length.
+    private static func unitRows(_ vectors: MLXArray, dimension: Int) throws -> [[Float]] {
+        try MLX.checkedEval(vectors)
+        let width = vectors.dim(1)
+        let values = vectors.asArray(Float.self)
+        return try stride(from: 0, to: values.count, by: width).map { start in
+            let row = values[start ..< start + width]
+            guard row.allSatisfy(\.isFinite), row.contains(where: { $0 != 0 }) else {
+                throw Error.invalidEmbedding
+            }
+            let truncated = row.prefix(dimension)
+            let norm = truncated.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
+            guard norm.isFinite, norm > 0 else { throw Error.invalidEmbedding }
+            return truncated.map { Float(Double($0) / norm) }
         }
     }
 
@@ -857,6 +968,13 @@ public actor EmbeddingGemma2Embedding {
             }
             return "title: none | text: \(text)"
         }
+    }
+}
+
+extension EmbeddingGemma2Embedding: ModelMemoryReporting {
+    /// Measure the model's tensor buffers, including the media encoders that have loaded.
+    public func memory() throws -> ModelMemory {
+        try model.memory()
     }
 }
 

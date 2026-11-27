@@ -201,8 +201,100 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         super.init()
     }
 
-    public func isCompatible(with target: any LanguageModel) -> Bool {
-        target is Gemma4BackboneProviding
+    public func validateCompatibility(with target: any LanguageModel) throws {
+        guard let provider = target as? any Gemma4BackboneProviding else {
+            throw MTPDrafterCompatibilityError.incompatibleTarget(
+                drafter: "Gemma4AssistantDraftModel",
+                expected: "a Gemma 4 VLM target",
+                actual: String(describing: type(of: target))
+            )
+        }
+
+        func mismatch(_ property: String, expected: String, actual: String)
+            -> MTPDrafterCompatibilityError
+        {
+            .incompatibleTarget(
+                drafter: "Gemma4AssistantDraftModel",
+                expected: "\(property) \(expected)",
+                actual: "\(type(of: target)) with \(property) \(actual)")
+        }
+
+        let backbone = provider.textBackbone
+        let targetConfig = backbone.config
+        let draftConfig = config.textConfiguration
+        guard targetConfig.hiddenSize == config.backboneHiddenSize else {
+            throw mismatch(
+                "hiddenSize", expected: "\(config.backboneHiddenSize)",
+                actual: "\(targetConfig.hiddenSize)")
+        }
+        guard targetConfig.vocabularySize == draftConfig.vocabularySize else {
+            throw mismatch(
+                "vocabularySize", expected: "\(draftConfig.vocabularySize)",
+                actual: "\(targetConfig.vocabularySize)")
+        }
+
+        let sourceCount = backbone.firstKVSharedLayerIdx
+        guard sourceCount > 0, sourceCount <= backbone.layers.count else {
+            throw mismatch(
+                "KV-owning layer count", expected: "in 1...\(backbone.layers.count)",
+                actual: "\(sourceCount)")
+        }
+        let sourceLayers = backbone.layers.prefix(sourceCount)
+        var targetAttention: [String: Gemma4TextAttention] = [:]
+        // The target emits drafter state only when both KV types are available.
+        for layerType in ["full_attention", "sliding_attention"] {
+            guard let source = sourceLayers.last(where: { $0.layerType == layerType }) else {
+                throw mismatch(
+                    "\(layerType) KV source", expected: "in the KV-owning layer prefix",
+                    actual: "missing")
+            }
+            targetAttention[layerType] = source.selfAttention
+        }
+
+        for layer in model.layers {
+            guard let source = targetAttention[layer.layerType] else {
+                throw mismatch(
+                    "drafter layer type", expected: "full_attention or sliding_attention",
+                    actual: layer.layerType)
+            }
+            let attention = layer.selfAttention
+            guard source.numHeads > 0, source.numKVHeads > 0,
+                attention.numHeads > 0, attention.numKVHeads > 0
+            else {
+                throw mismatch(
+                    "\(layer.layerType) head counts", expected: "positive query and KV counts",
+                    actual: "target Q=\(source.numHeads), KV=\(source.numKVHeads); "
+                        + "drafter Q=\(attention.numHeads), KV=\(attention.numKVHeads)")
+            }
+            guard source.headDim == attention.headDim else {
+                throw mismatch(
+                    "\(layer.layerType) headDim", expected: "\(attention.headDim)",
+                    actual: "\(source.headDim)")
+            }
+            guard source.numKVHeads == attention.numKVHeads else {
+                throw mismatch(
+                    "\(layer.layerType) numKVHeads", expected: "\(attention.numKVHeads)",
+                    actual: "\(source.numKVHeads)")
+            }
+            guard attention.numHeads % source.numKVHeads == 0 else {
+                throw mismatch(
+                    "\(layer.layerType) drafter query heads",
+                    expected: "a multiple of \(source.numKVHeads)",
+                    actual: "\(attention.numHeads)")
+            }
+        }
+
+        guard draftConfig.slidingWindow > 0 else {
+            throw mismatch(
+                "drafter slidingWindow", expected: "greater than 0",
+                actual: "\(draftConfig.slidingWindow)")
+        }
+        let targetWindow = targetConfig.slidingWindow > 0 ? targetConfig.slidingWindow : 4096
+        guard targetWindow <= draftConfig.slidingWindow else {
+            throw mismatch(
+                "effective target slidingWindow", expected: "at most \(draftConfig.slidingWindow)",
+                actual: "\(targetWindow)")
+        }
     }
 
     public func draftBlock(
@@ -277,36 +369,30 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         // Per-layer-type masks; KV tensor shape is [B, H, S, D] so axis -2 = seq.
         let fullKvLen = sharedKV["full_attention"].map { $0.0.dim(-2) } ?? 0
         let slidingKvLen = sharedKV["sliding_attention"].map { $0.0.dim(-2) } ?? 0
+        // Production invariant: the target's sliding-attention KV cache is
+        // capped at `slidingWindow` by `RotatingKVCache(maxSize:keep:)` (see
+        // `Gemma4TextLanguageModel.newCache`), so `slidingKvLen` is always
+        // bounded by `textCfg.slidingWindow`. That bound is what makes the
+        // bidirectional sliding-window mask's early-exit branch
+        // (`windowSize >= kvLen` → all-zeros mask) fire on every production
+        // call. If this invariant ever changes — e.g. a different cache
+        // policy that lets the sliding KV grow past `slidingWindow` — the
+        // mask helper's `windowSize >= kvLen` branch would NOT fire, and the
+        // helper's non-degenerate path produces an absolute-position mask
+        // that does not match the distance-from-`queryOffset` mask the
+        // drafter actually needs. Catching the violation here is much louder
+        // than a silently wrong attention pattern downstream.
+        precondition(
+            slidingKvLen <= textCfg.slidingWindow,
+            "sliding KV length \(slidingKvLen) exceeds slidingWindow \(textCfg.slidingWindow) — "
+                + "the production invariant that lets the bidirectional sliding-window "
+                + "mask early-exit to all-zeros has been violated"
+        )
         let fullMask = createBidirectionalMask(
             queryLen: queryLen, kvLen: fullKvLen, dtype: h.dtype)
-        // When the target's sliding-attention cache is bounded by the drafter's
-        // `slidingWindow` (same window on both sides), the helper's early-exit
-        // (`windowSize >= kvLen` → all-zeros mask) is the production path.
-        // When the backbone uses a LARGER sliding window than the drafter
-        // (e.g. an assistant with a 512 window drafted against a wider-window
-        // backbone), the shared sliding KV can legitimately exceed the
-        // drafter's window. The helper's non-degenerate path is an
-        // absolute-position mask (`kIdx < windowSize`), which is NOT what the
-        // drafter needs here, so build a newest-`windowSize` mask inline:
-        // the target's `RotatingKVCache` snapshot is temporally ordered
-        // (oldest at index 0) until the backbone's own window forces rotation,
-        // which cannot have happened while `slidingKvLen` is still growing
-        // past the drafter's smaller window.
-        let slidingMask: MLXArray
-        if slidingKvLen <= textCfg.slidingWindow {
-            slidingMask = createBidirectionalSlidingWindowMask(
-                queryLen: queryLen, kvLen: slidingKvLen,
-                windowSize: textCfg.slidingWindow, dtype: h.dtype)
-        } else {
-            let kIdx = MLXArray(Int32(0) ..< Int32(slidingKvLen))
-            let attend = kIdx .>= Int32(slidingKvLen - textCfg.slidingWindow)
-            let row = MLX.where(
-                attend,
-                MLXArray(0, dtype: h.dtype),
-                MLXArray(-Float.infinity, dtype: h.dtype)
-            )
-            slidingMask = broadcast(row[.newAxis, 0...], to: [queryLen, slidingKvLen])
-        }
+        let slidingMask = createBidirectionalSlidingWindowMask(
+            queryLen: queryLen, kvLen: slidingKvLen,
+            windowSize: textCfg.slidingWindow, dtype: h.dtype)
 
         for layer in model.layers {
             guard let kvPair = sharedKV[layer.layerType] else {

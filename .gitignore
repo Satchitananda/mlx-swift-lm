@@ -103,3 +103,4 @@ uv.lock
 main.py
 
 .gstack/
+.worktrees

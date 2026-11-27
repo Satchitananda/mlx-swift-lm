@@ -162,6 +162,7 @@ let package = Package(
             dependencies: [
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "Libraries/MLXScriptedLM",
             exclude: ["README.md"]
@@ -225,12 +226,6 @@ let package = Package(
         .target(
             name: "MLXCXGrammar",
             path: "Libraries/MLXCXGrammar",
-            exclude: [
-                // Compiled via Libraries/MLXCXGrammar/grammar_functor_wrapper.cc to
-                // provide out-of-class definitions for static const members that
-                // clang ODR-uses through variadic templates.
-                "xgrammar/cpp/grammar_functor.cc"
-            ],
             publicHeadersPath: "include",
             cxxSettings: [
                 .headerSearchPath("xgrammar/include"),
@@ -272,7 +267,10 @@ let package = Package(
                 "MLXCXGrammar",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXGuidedGeneration"
+            path: "Libraries/MLXGuidedGeneration",
+            exclude: [
+                "README.md"
+            ]
         ),
         // Bridges Apple's FoundationModels framework to MLX-powered on-device
         // inference. Public surface is gated by @available(macOS 27 / iOS 27 /
@@ -292,7 +290,10 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXFoundationModels"
+            path: "Libraries/MLXFoundationModels",
+            exclude: [
+                "README.md"
+            ]
         ),
         .testTarget(
             name: "MLXFoundationModelsTests",
@@ -327,6 +328,7 @@ let package = Package(
                 "MLXGuidedGeneration",
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "Tests/MLXGuidedGenerationTests"
         ),

@@ -4,20 +4,6 @@ import Foundation
 import MLX
 import MLXNN
 
-// MLX traces a compiled function once. Any MLXArray the body reads but does not
-// take as an argument becomes a constant of that trace, so weights read through
-// a captured module freeze at the values of the first call. Plain inference
-// never notices. An adapter load, fuse, or unload, or a training step, keeps
-// producing the old weights.
-//
-// MLX's stateless `compile` overloads take a `@Sendable` body (mlx-swift #469,
-// which took the idea from this package). `MLXArray` and `Module` are not
-// `Sendable`, so that capture does not build. Bodies that read weights use
-// `CompiledTrace`, which declares them as compile state.
-//
-// `MLX.compile(inputs:outputs:)` is untouched: declaring captured state there
-// is correct, and it remains the way to compile a training step.
-
 /// A compiled trace of a body that reads module weights.
 ///
 /// The declared modules' weights become compile `inputs:`, so every call reads
@@ -60,8 +46,6 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
     // Compiled on first call rather than at init, because weights load later.
     // The lock keeps two concurrent first calls from installing rival traces.
     private let lock = NSLock()
-    // Not `@Sendable`: the compiled function declares the owner's weights as
-    // state, and MLX returns a plain closure for stateful compiles (#469).
     private var function: (([MLXArray]) -> [MLXArray])?
     private var tracedOwner: ObjectIdentifier?
 

@@ -23,7 +23,7 @@ possible.
 
 Unit tests do not download models; tests evaluating MLX arrays need Metal.
 For this fork's verified SwiftPM setup, including the matching Metal library
-and serial full-precision numerical gate, see [Qwen runtime validation](QWEN38_INTEGRATION.md#validation).
+and serial full-precision numerical gate, see [fork sync validation](UPSTREAM_RELEASE_SYNC.md#validation).
 Xcode also assembles the test bundle:
 
 ```bash
@@ -51,7 +51,7 @@ xcodebuild test \
   -scheme IntegrationTesting \
   -destination 'platform=macOS' \
   -skipPackagePluginValidation \
-  -only-testing:IntegrationTestingTests/ToolCallIntegrationTests/qwen35FormatAutoDetection\(\)
+  -only-testing:IntegrationTestingTests/ModelLoadingSuite/ToolCallIntegrationTests/qwen35FormatAutoDetection\(\)
 ```
 
 See [Libraries/IntegrationTestHelpers/README.md](Libraries/IntegrationTestHelpers/README.md) for more details.

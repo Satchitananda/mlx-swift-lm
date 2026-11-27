@@ -65,11 +65,14 @@ let output = try await container.perform { context in
     // 1. Extract the vocab in the shape XGrammar expects.
     let grammarVocab = TokenizerVocabExtractor.extractForGrammar(from: tokenizer)
 
-    // 2. Build a grammar tokenizer.
+    // 2. Build a grammar tokenizer. Register every token that ends a turn
+    //    (here EOS plus the configuration's EOS ids) so the grammar masks
+    //    all of them until the output is complete.
+    let stopTokenIds = context.configuration.eosTokenIds.union([tokenizer.eosTokenId ?? 0])
     let grammarTokenizer = try GrammarTokenizer(
         vocab: grammarVocab.vocab,
         vocabType: grammarVocab.vocabType,
-        eosTokenId: Int32(tokenizer.eosTokenId ?? 0))
+        stopTokenIds: stopTokenIds.sorted().map(Int32.init))
 
     // 3. Compile a JSON Schema into a constraint.
     let schema = #"{"type":"object","properties":{"name":{"type":"string"},"knownFor":{"type":"string"}}}"#
@@ -107,6 +110,20 @@ print(output)  // valid JSON matching `schema`
 > the compile. Pre-warming the expected schema with a throwaway
 > `GrammarConstraint` from a background task before the user-visible request
 > removes the blocking window entirely.
+
+### JSON formatting
+
+`GrammarConstraint(tokenizer:jsonSchema:format:)` takes a `JSONSchemaFormat`,
+whose fields map onto XGrammar's `CompileJSONSchema` parameters. The default
+(any whitespace, strict mode) is XGrammar's own. For single-line JSON with no
+whitespace use `.compact`; for pretty-printed output use
+`JSONSchemaFormat(anyWhitespace: false, indent: 2)`. Set `strictMode: false` to
+allow properties and items the schema does not declare.
+
+```swift
+let constraint = try GrammarConstraint(
+    tokenizer: grammarTokenizer, jsonSchema: schema, format: .compact)
+```
 
 ## Why it is bundled this way
 
